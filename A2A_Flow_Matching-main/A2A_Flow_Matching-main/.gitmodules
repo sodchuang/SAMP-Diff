@@ -1,3 +1,0 @@
-[submodule "third_party/curobo"]
-	path = third_party/curobo
-	url = git@github.com:RoboVerseOrg/curobo.git

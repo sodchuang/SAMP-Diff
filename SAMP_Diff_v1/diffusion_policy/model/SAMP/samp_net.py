@@ -451,8 +451,10 @@ class SampNet(nn.Module):
         B = x_t.shape[0]
 
         # --- condition embedding ---
-        cond = global_cond.reshape(B, self.n_obs_steps, -1)  # (B, To, raw_dim)
-        cond_emb = self.condition_proj(cond)                  # (B, To, E)
+        # Keep global_cond flat and project as a single condition token.
+        # global_cond: (B, n_obs_steps * obs_dim) = (B, condition_dim)
+        cond = global_cond.unsqueeze(1)               # (B, 1, condition_dim)
+        cond_emb = self.condition_proj(cond)          # (B, 1, E)
 
         # --- time embedding ---
         t_emb = sinusoidal_time_embed(t, self.time_embed_dim)  # (B, E)

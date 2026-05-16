@@ -1,0 +1,60 @@
+# SAMP_Diff_v1 依賴套件
+# 安裝方式：見 scripts/install.sh
+# PyTorch + CUDA 需單獨安裝（見 install.sh），不在此列
+
+# ── 數值計算 ──────────────────────────────────────────────────
+numpy==1.23.3
+scipy==1.9.1
+numba==0.56.4
+
+# ── 資料儲存 ──────────────────────────────────────────────────
+zarr==2.12.0
+numcodecs==0.10.2
+h5py==3.7.0
+dill==0.3.5.1
+
+# ── 影像 / 視覺 ───────────────────────────────────────────────
+opencv-python==4.6.0.66
+scikit-image==0.19.3
+scikit-video==1.1.11
+imageio==2.22.0
+imageio-ffmpeg==0.4.7
+imagecodecs==2022.9.26
+
+# ── 深度學習工具 ──────────────────────────────────────────────
+einops==0.4.1
+hydra-core==1.2.0
+diffusers==0.11.1
+accelerate==0.13.2
+tensorboard==2.10.1
+tensorboardX==2.5.1
+
+# ── 訓練 / 監控 ───────────────────────────────────────────────
+wandb==0.13.3
+tqdm==4.64.1
+psutil==5.9.2
+click==8.0.4
+termcolor==2.0.1
+boto3==1.24.96
+
+# ── 模擬環境 ──────────────────────────────────────────────────
+gym==0.21.0
+pymunk==6.2.1
+pygame==2.1.2
+shapely==1.8.4
+dm-control==1.0.9
+robomimic==0.2.0
+
+# ── 分散式訓練 ────────────────────────────────────────────────
+ray[default,tune]==2.2.0
+
+# ── SAMP-Diff 專用 ────────────────────────────────────────────
+torchcfm
+torch-dct
+
+# ── 特殊來源（install.sh 另行安裝）──────────────────────────────
+# torch==1.12.1+cu116            → --index-url https://download.pytorch.org/whl/cu116
+# torchvision==0.13.1+cu116      → 同上
+# free-mujoco-py==2.1.6          → 需系統套件 libosmesa6-dev libgl1-mesa-glx libglfw3 patchelf
+# robosuite                      → git url
+# pytorch3d==0.7.0               → 需配合 CUDA 版本編譯

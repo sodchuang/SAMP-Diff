@@ -1,0 +1,159 @@
+# SAMP_Diff_v1 — LeRobot ALOHA config
+# 雙臂操作任務：物品轉移（transfer cube）
+# 資料集自動從 HuggingFace Hub 下載
+# 模擬環境：gym_aloha/AlohaTransferCube-v0（需 pip install gym-aloha）
+#
+# 換任務只需修改 task.repo_id 與 env_runner.gym_env_id：
+#   lerobot/aloha_sim_insertion_human   → gym_aloha/AlohaInsertion-v0
+#   lerobot/aloha_sim_transfer_cube_scripted → gym_aloha/AlohaTransferCube-v0
+
+_target_: diffusion_policy.workspace.train_samp_lowdim_workspace.TrainSampLowdimWorkspace
+
+# ── 維度 ─────────────────────────────────────────────────────────────
+# ALOHA: state=[left_arm_joints(6)+left_gripper(1)+right_arm_joints(6)+right_gripper(1)]
+#        = 14-dim；action = 14-dim（目標關節角）
+action_dim: 14
+obs_dim: 14
+horizon: 100           # ALOHA episode 較長，使用較大 horizon
+n_obs_steps: 1
+n_action_steps: 100    # 一次規劃整個 chunk（ACT 風格）
+n_latency_steps: 0
+obs_as_global_cond: true
+obs_as_local_cond: false
+pred_action_steps_only: false
+oa_step_convention: true
+
+checkpoint:
+  save_last_ckpt: true
+  save_last_snapshot: false
+  topk:
+    format_str: epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt
+    k: 5
+    mode: max
+    monitor_key: test_mean_score
+
+dataloader:
+  batch_size: 64
+  num_workers: 4
+  persistent_workers: false
+  pin_memory: true
+  shuffle: true
+
+val_dataloader:
+  batch_size: 64
+  num_workers: 4
+  persistent_workers: false
+  pin_memory: true
+  shuffle: false
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  inv_gamma: 1.0
+  max_value: 0.9999
+  min_value: 0.0
+  power: 0.75
+  update_after_step: 0
+
+exp_name: default
+
+logging:
+  group: null
+  id: null
+  mode: offline
+  project: samp_diff_v1
+  entity: null
+  name: train_samp_lowdim_lerobot_aloha
+  resume: true
+  tags:
+    - samp_lowdim
+    - lerobot
+    - aloha
+
+multi_run:
+  run_dir: data/outputs/samp_lowdim_lerobot_aloha
+  wandb_name_base: samp_lowdim_lerobot_aloha
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas:
+    - 0.95
+    - 0.999
+  eps: 1.0e-08
+  lr: 0.0001
+  weight_decay: 1.0e-06
+
+training:
+  device: cuda:0
+  seed: 42
+  debug: false
+  resume: true
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 3050
+  gradient_accumulate_every: 1
+  use_ema: true
+  rollout_every: 50
+  checkpoint_every: 50
+  val_every: 1
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+policy:
+  _target_: diffusion_policy.policy.samp_lowdim_policy.SampLowdimPolicy
+
+  horizon: ${horizon}
+  obs_dim: ${obs_dim}
+  action_dim: ${action_dim}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+  obs_as_global_cond: ${obs_as_global_cond}
+  obs_as_local_cond: ${obs_as_local_cond}
+  pred_action_steps_only: ${pred_action_steps_only}
+  oa_step_convention: ${oa_step_convention}
+
+  # SampNet Transformer（ALOHA 使用較大模型）
+  encoder_embed_dim: 512
+  decoder_embed_dim: 512
+  encoder_depth: 6
+  decoder_depth: 6
+  encoder_num_heads: 8
+  decoder_num_heads: 8
+  mask: true
+  num_iter: 4
+
+  # Flow Matching
+  num_inference_steps: 6
+  fm_sigma: 0.0
+
+  # A2A warm-start
+  sigma: 0.05          # ALOHA 動作較平滑，使用較小噪聲
+
+task:
+  repo_id: lerobot/aloha_sim_transfer_cube_human
+  obs_key: observation.state
+  action_key: action
+
+  dataset:
+    _target_: diffusion_policy.dataset.lerobot_lowdim_dataset.LeRobotLowdimDataset
+    repo_id: ${task.repo_id}
+    obs_key: ${task.obs_key}
+    action_key: ${task.action_key}
+    horizon: ${horizon}
+    pad_before: 1
+    pad_after: 99
+    seed: 42
+    val_ratio: 0.02
+
+  env_runner:
+    _target_: diffusion_policy.env_runner.lerobot_lowdim_runner.LeRobotLowdimRunner
+    gym_env_id: gym_aloha/AlohaTransferCube-v0
+    obs_key: ${task.obs_key}
+    n_test: 50
+    max_steps: 1000
+    n_obs_steps: ${n_obs_steps}
+    n_action_steps: ${n_action_steps}
+    fps: 50
+    tqdm_interval_sec: 1.0
+    output_dir: ${hydra:runtime.output_dir}
