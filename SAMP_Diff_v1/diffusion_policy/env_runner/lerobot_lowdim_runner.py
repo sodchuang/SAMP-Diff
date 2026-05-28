@@ -42,6 +42,7 @@ class LeRobotLowdimRunner(BaseLowdimRunner):
         output_dir: str,
         gym_env_id: str = "gym_pusht/PushT-v0",
         obs_key: str = "observation.state",
+        obs_dim: Optional[int] = None,
         n_train: int = 0,
         n_test: int = 50,
         max_steps: int = 500,
@@ -55,6 +56,7 @@ class LeRobotLowdimRunner(BaseLowdimRunner):
         super().__init__(output_dir)
         self.gym_env_id     = gym_env_id
         self.obs_key        = obs_key
+        self.obs_dim        = obs_dim   # if set, slice state to first obs_dim dims
         self.n_test         = n_test
         self.max_steps      = max_steps
         self.n_obs_steps    = n_obs_steps
@@ -87,7 +89,7 @@ class LeRobotLowdimRunner(BaseLowdimRunner):
 
             # 初始化觀測佇列（用來 stack n_obs_steps 幀）
             obs_deque: collections.deque = collections.deque(
-                [_extract_state(raw_obs, self.obs_key)] * self.n_obs_steps,
+                [_extract_state(raw_obs, self.obs_key, self.obs_dim)] * self.n_obs_steps,
                 maxlen=self.n_obs_steps,
             )
 
@@ -111,7 +113,7 @@ class LeRobotLowdimRunner(BaseLowdimRunner):
                     raw_obs, reward, terminated, truncated, info = env.step(
                         actions[a_idx]
                     )
-                    obs_deque.append(_extract_state(raw_obs, self.obs_key))
+                    obs_deque.append(_extract_state(raw_obs, self.obs_key, self.obs_dim))
                     total_reward += float(reward)
                     step += 1
                     done = terminated or truncated or step >= self.max_steps
@@ -155,8 +157,8 @@ def _make_env(gym_env_id: str, render_size: int, seed: int = 0):
     return env
 
 
-def _extract_state(raw_obs, obs_key: str) -> np.ndarray:
-    """從 gym 觀測中取出 lowdim state。"""
+def _extract_state(raw_obs, obs_key: str, obs_dim: Optional[int] = None) -> np.ndarray:
+    """從 gym 觀測中取出 lowdim state，可選擇截取前 obs_dim 維。"""
     if isinstance(raw_obs, dict):
         val = raw_obs.get(obs_key, raw_obs.get("observation", None))
         if val is None:
@@ -169,7 +171,10 @@ def _extract_state(raw_obs, obs_key: str) -> np.ndarray:
             val = np.concatenate(arrays, axis=0)
     else:
         val = raw_obs
-    return np.asarray(val, dtype=np.float32)
+    arr = np.asarray(val, dtype=np.float32)
+    if obs_dim is not None:
+        arr = arr[:obs_dim]
+    return arr
 
 
 def _extract_success(info: dict, total_reward: float) -> bool:

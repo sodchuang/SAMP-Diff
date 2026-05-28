@@ -21,9 +21,9 @@ import tqdm
 
 from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
-from diffusion_policy.policy.samp_lowdim_policy import SampLowdimPolicy
-from diffusion_policy.dataset.base_dataset import BaseLowdimDataset
-from diffusion_policy.env_runner.base_lowdim_runner import BaseLowdimRunner
+from diffusion_policy.policy.samp_image_policy import SampImagePolicy
+from diffusion_policy.dataset.base_dataset import BaseImageDataset
+from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
 from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
 from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
@@ -32,7 +32,7 @@ from diffusers.training_utils import EMAModel
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 
-class TrainSampLowdimWorkspace(BaseWorkspace):
+class TrainSampImageWorkspace(BaseWorkspace):
     include_keys = ['global_step', 'epoch']
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
@@ -45,10 +45,10 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
         random.seed(seed)
 
         # configure model
-        self.model: SampLowdimPolicy
+        self.model: SampImagePolicy
         self.model = hydra.utils.instantiate(cfg.policy)
 
-        self.ema_model: SampLowdimPolicy = None
+        self.ema_model: SampImagePolicy = None
         if cfg.training.use_ema:
             self.ema_model = copy.deepcopy(self.model)
 
@@ -71,9 +71,9 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
                 self.load_checkpoint(path=lastest_ckpt_path)
 
         # configure dataset
-        dataset: BaseLowdimDataset
+        dataset: BaseImageDataset
         dataset = hydra.utils.instantiate(cfg.task.dataset)
-        assert isinstance(dataset, BaseLowdimDataset)
+        assert isinstance(dataset, BaseImageDataset)
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
         normalizer = dataset.get_normalizer()
 
@@ -102,11 +102,11 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
             ema = hydra.utils.instantiate(cfg.ema, model=self.ema_model)
 
         # configure env runner
-        env_runner: BaseLowdimRunner
+        env_runner: BaseImageRunner
         env_runner = hydra.utils.instantiate(
             cfg.task.env_runner, output_dir=self.output_dir
         )
-        assert isinstance(env_runner, BaseLowdimRunner)
+        assert isinstance(env_runner, BaseImageRunner)
 
         # configure logging
         wandb_run = wandb.init(
@@ -116,21 +116,14 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
         )
         wandb.config.update({"output_dir": self.output_dir})
 
-        # ── 資料集分割統計 ────────────────────────────────────────
+        # dataset size stats
         n_train_samples = len(dataset)
-        n_val_samples = len(val_dataset)
+        n_val_samples   = len(val_dataset)
         print(f"[Dataset] train samples: {n_train_samples} | val samples: {n_val_samples}")
         wandb.config.update({
             "n_train_samples": n_train_samples,
-            "n_val_samples": n_val_samples,
+            "n_val_samples":   n_val_samples,
         }, allow_val_change=True)
-        # 若 dataset 支援 split_info（SampConcatLowdimDataset），記錄逐子集統計
-        if hasattr(dataset, 'split_info'):
-            for info in dataset.split_info():
-                print(
-                    f"  [{info['class']}] idx={info['dataset_idx']} "
-                    f"train={info['n_train_samples']} val={info['n_val_samples']}"
-                )
 
         # configure checkpoint
         topk_manager = TopKCheckpointManager(
@@ -148,13 +141,13 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
         train_sampling_batch = None
 
         if cfg.training.debug:
-            cfg.training.num_epochs = 2
-            cfg.training.max_train_steps = 3
-            cfg.training.max_val_steps = 3
-            cfg.training.rollout_every = 1
-            cfg.training.checkpoint_every = 1
-            cfg.training.val_every = 1
-            cfg.training.sample_every = 1
+            cfg.training.num_epochs        = 2
+            cfg.training.max_train_steps   = 3
+            cfg.training.max_val_steps     = 3
+            cfg.training.rollout_every     = 1
+            cfg.training.checkpoint_every  = 1
+            cfg.training.val_every         = 1
+            cfg.training.sample_every      = 1
 
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
@@ -191,10 +184,10 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
                         tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
                         train_losses.append(raw_loss_cpu)
                         step_log = {
-                            'train_loss': raw_loss_cpu,
+                            'train_loss':  raw_loss_cpu,
                             'global_step': self.global_step,
-                            'epoch': self.epoch,
-                            'lr': lr_scheduler.get_last_lr()[0],
+                            'epoch':       self.epoch,
+                            'lr':          lr_scheduler.get_last_lr()[0],
                         }
 
                         is_last_batch = batch_idx == (len(train_dataloader) - 1)
@@ -218,14 +211,13 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
                     policy = self.ema_model
                 policy.eval()
 
-                # run rollout（跳過 epoch 0，避免訓練前就做 CPU rollout）
+                # rollout (skip epoch 0)
                 if self.epoch > 0 and self.epoch % cfg.training.rollout_every == 0:
                     runner_log = env_runner.run(policy)
                     step_log.update(runner_log)
-                    # runner moves policy to CPU; restore to training device
                     policy.to(device)
 
-                # run validation
+                # validation
                 if self.epoch % cfg.training.val_every == 0:
                     with torch.no_grad():
                         val_losses = list()
@@ -248,20 +240,20 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
                             val_loss = torch.mean(torch.tensor(val_losses)).item()
                             step_log['val_loss'] = val_loss
 
-                # run sampling on a training batch
+                # sample eval on a training batch
                 if self.epoch % cfg.training.sample_every == 0:
                     with torch.no_grad():
-                        batch = train_sampling_batch
-                        obs_dict = {'obs': batch['obs']}
-                        gt_action = batch['action']
-                        # reset warm-start buffer so sampling is deterministic
+                        batch      = train_sampling_batch
+                        # obs_dict for image policy is the nested obs dict directly
+                        obs_dict   = dict_apply(batch['obs'], lambda x: x.to(device))
+                        gt_action  = batch['action']
                         policy.reset()
                         result = policy.predict_action(obs_dict)
                         if cfg.pred_action_steps_only:
                             pred_action = result['action']
-                            start = cfg.n_obs_steps - 1
-                            end = start + cfg.n_action_steps
-                            gt_action = gt_action[:, start:end]
+                            start       = cfg.n_obs_steps - 1
+                            end         = start + cfg.n_action_steps
+                            gt_action   = gt_action[:, start:end]
                         else:
                             pred_action = result['action_pred']
                         mse = torch.nn.functional.mse_loss(pred_action, gt_action)
@@ -270,7 +262,7 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
 
                 # checkpoint
                 if self.epoch % cfg.training.checkpoint_every == 0:
-                    mean_test_score = step_log.get("test/mean_score", 0.0)
+                    mean_test_score  = step_log.get("test/mean_score",  0.0)
                     mean_train_score = step_log.get("train/mean_score", 0.0)
                     self.save_checkpoint(
                         f"{self.output_dir}/checkpoints/"

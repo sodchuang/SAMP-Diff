@@ -44,6 +44,14 @@ class PushTKeypointsRunner(BaseLowdimRunner):
         if n_envs is None:
             n_envs = n_train + n_test
 
+        # ensure pygame is usable on headless servers before any env creation
+        import os
+        import pygame
+        os.environ.setdefault('SDL_VIDEODRIVER', 'dummy')
+        os.environ.setdefault('SDL_AUDIODRIVER', 'dummy')
+        if not pygame.get_init():
+            pygame.init()
+
         # handle latency step
         # to mimic latency, we request n_latency_steps additional steps 
         # of past observations, and the discard the last n_latency_steps
@@ -54,6 +62,12 @@ class PushTKeypointsRunner(BaseLowdimRunner):
         kp_kwargs = PushTKeypointsEnv.genenerate_keypoint_manager_params()
 
         def env_fn():
+            import os
+            import pygame
+            os.environ.setdefault('SDL_VIDEODRIVER', 'dummy')
+            os.environ.setdefault('SDL_AUDIODRIVER', 'dummy')
+            if not pygame.get_init():
+                pygame.init()
             return MultiStepWrapper(
                 VideoRecordingWrapper(
                     PushTKeypointsEnv(
@@ -133,7 +147,7 @@ class PushTKeypointsRunner(BaseLowdimRunner):
             env_prefixs.append('test/')
             env_init_fn_dills.append(dill.dumps(init_fn))
 
-        env = AsyncVectorEnv(env_fns)
+        env = AsyncVectorEnv(env_fns, shared_memory=False)
 
         # test env
         # env.reset(seed=env_seeds)

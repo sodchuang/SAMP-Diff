@@ -113,6 +113,9 @@ class SampNet(nn.Module):
         mask: bool = True,
         num_iter: int = 4,
         sigma: float = 0.1,
+        freq_split_low: int = 0,
+        freq_split_high: int = 4,
+        sigma_high: float = -1.0,   # noise for out-of-band; <0 → pure N(0,I)
         patch_size: int = 1,
         **kwargs,
     ):
@@ -128,9 +131,14 @@ class SampNet(nn.Module):
         self.encoder_embed_dim = encoder_embed_dim
         self.decoder_embed_dim = decoder_embed_dim
         self.condition_embed_dim = encoder_embed_dim
-        self.buffer_size = 3
+        self.buffer_size = n_obs_steps   # one buffer slot per observation step
         self.mask = mask
         self.sigma = sigma
+        # v2: warm-start band [freq_split_low : freq_split_high] with sigma noise
+        #     out-of-band: DCT(prev) + sigma_high * noise  (sigma_high<0 → pure N(0,I))
+        self.freq_split_low  = max(0, freq_split_low)
+        self.freq_split_high = max(self.freq_split_low, freq_split_high)
+        self.sigma_high = sigma_high   # <0 means pure random (original v2 behaviour)
 
         # ---- progressive masking schedule (kept from Freqpolicy) ----
         core_2 = 5
@@ -154,8 +162,11 @@ class SampNet(nn.Module):
         ]
 
         # ---- condition projection ----
+        # Projects a single observation step (obs_dim) to encoder embedding dim.
+        # global_cond is split into n_obs_steps tokens, each of size obs_dim.
         self.condition_dim = condition_dim
-        self.condition_proj = nn.Linear(condition_dim, self.condition_embed_dim)
+        self.obs_dim_per_step = condition_dim // n_obs_steps
+        self.condition_proj = nn.Linear(self.obs_dim_per_step, self.condition_embed_dim)
         self.embedding_index = nn.Linear(1, self.condition_embed_dim)
 
         # ---- time embedding for flow matching t ∈ [0, 1] ----
@@ -451,10 +462,13 @@ class SampNet(nn.Module):
         B = x_t.shape[0]
 
         # --- condition embedding ---
-        # Keep global_cond flat and project as a single condition token.
-        # global_cond: (B, n_obs_steps * obs_dim) = (B, condition_dim)
-        cond = global_cond.unsqueeze(1)               # (B, 1, condition_dim)
-        cond_emb = self.condition_proj(cond)          # (B, 1, E)
+        # Reshape global_cond from (B, To*obs_dim) → (B, To, obs_dim) so each
+        # observation step becomes an independent cross-attention key/value token.
+        # This makes full use of the buffer_size slots in the encoder/decoder.
+        To = self.n_obs_steps
+        obs_dim = global_cond.shape[-1] // To
+        cond = global_cond.view(B, To, obs_dim)   # (B, To, obs_dim)
+        cond_emb = self.condition_proj(cond)       # (B, To, E)
 
         # --- time embedding ---
         t_emb = sinusoidal_time_embed(t, self.time_embed_dim)  # (B, E)
@@ -483,25 +497,44 @@ class SampNet(nn.Module):
         actions_gt: torch.Tensor,
         prev_actions: torch.Tensor,
         global_cond: torch.Tensor,
+        cold_start_prob: float = 0.2,
     ) -> torch.Tensor:
         """Compute flow-matching loss.
 
         Args:
-            flow_matcher : TorchFlowMatcher instance.
-            actions_gt   : (B, H, Da) ground-truth normalised actions.
-            prev_actions : (B, H, Da) previous-frame normalised actions (warm-start).
-                           Pass zeros for the first batch item when unavailable.
-            global_cond  : (B, To * obs_dim) flattened observation condition.
+            flow_matcher    : TorchFlowMatcher instance.
+            actions_gt      : (B, H, Da) ground-truth normalised actions.
+            prev_actions    : (B, H, Da) previous-frame normalised actions (warm-start).
+                              Pass zeros for the first batch item when unavailable.
+            global_cond     : (B, To * obs_dim) flattened observation condition.
+            cold_start_prob : Probability of replacing warm-start with N(0,I) to
+                              match the first-step inference distribution.
 
         Returns:
             loss : scalar tensor.
         """
+        B = actions_gt.shape[0]
+
         # x_1 — target in full DCT space
         x_1 = self.full_dct(actions_gt)
 
-        # x_0 — warm-start: DCT of previous actions + small Gaussian noise
-        x_0_base = self.full_dct(prev_actions)
-        x_0 = x_0_base + self.sigma * torch.randn_like(x_0_base)
+        # x_0 — v2 frequency-band prior:
+        #   band [fl : fh]  : DCT(prev) + sigma * noise       (warm memory)
+        #   out-of-band     : DCT(prev) + sigma_high * noise  (soft memory)
+        #                     sigma_high < 0 → pure N(0,I)   (hard reset, original v2)
+        x_0_dct = self.full_dct(prev_actions)          # (B, H, Da)
+        fl, fh  = self.freq_split_low, self.freq_split_high
+        mid  = x_0_dct[:, fl:fh, :] + self.sigma * torch.randn_like(x_0_dct[:, fl:fh, :])
+        if self.sigma_high < 0:
+            pre  = torch.randn_like(x_0_dct[:, :fl, :])
+            post = torch.randn_like(x_0_dct[:, fh:, :])
+        else:
+            pre  = x_0_dct[:, :fl, :] + self.sigma_high * torch.randn_like(x_0_dct[:, :fl, :])
+            post = x_0_dct[:, fh:, :] + self.sigma_high * torch.randn_like(x_0_dct[:, fh:, :])
+        x_0_warm = torch.cat([pre, mid, post], dim=1)  # (B, H, Da)
+        x_0_cold = torch.randn_like(x_1)
+        cold_mask = (torch.rand(B, device=x_1.device) < cold_start_prob).view(B, 1, 1)
+        x_0 = torch.where(cold_mask, x_0_cold, x_0_warm)
 
         # optional MAE mask
         mask = None
@@ -548,8 +581,16 @@ class SampNet(nn.Module):
         if prev_actions is None:
             x_0 = torch.randn(B, H, Da, device=device)
         else:
-            x_0_base = self.full_dct(prev_actions)
-            x_0 = x_0_base + self.sigma * torch.randn_like(x_0_base)
+            x_0_dct = self.full_dct(prev_actions)
+            fl, fh  = self.freq_split_low, self.freq_split_high
+            mid  = x_0_dct[:, fl:fh, :] + self.sigma * torch.randn_like(x_0_dct[:, fl:fh, :])
+            if self.sigma_high < 0:
+                pre  = torch.randn_like(x_0_dct[:, :fl, :])
+                post = torch.randn_like(x_0_dct[:, fh:, :])
+            else:
+                pre  = x_0_dct[:, :fl, :] + self.sigma_high * torch.randn_like(x_0_dct[:, :fl, :])
+                post = x_0_dct[:, fh:, :] + self.sigma_high * torch.randn_like(x_0_dct[:, fh:, :])
+            x_0 = torch.cat([pre, mid, post], dim=1)
 
         def _vel_fn(x_t, t, **kw):
             return self.velocity_fn(x_t, t, global_cond=global_cond)

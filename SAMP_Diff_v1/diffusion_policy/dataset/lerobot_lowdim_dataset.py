@@ -62,43 +62,46 @@ class LeRobotLowdimDataset(BaseLowdimDataset):
         local_files_only: bool = False,
     ):
         try:
-            from lerobot.common.datasets.lerobot_dataset import LeRobotDataset as HFDataset
-        except ImportError as e:
-            raise ImportError(
-                "LeRobot is not installed. Run: pip install lerobot"
-            ) from e
+            from lerobot.datasets.lerobot_dataset import LeRobotDataset as HFDataset
+        except ImportError:
+            try:
+                from lerobot.common.datasets.lerobot_dataset import LeRobotDataset as HFDataset
+            except ImportError as e:
+                raise ImportError(
+                    f"LeRobot is not installed or has an import error: {e}\nRun: pip install lerobot"
+                ) from e
 
         # ── 從 HuggingFace 載入資料集 ──────────────────────────────────
         hf_dataset = HFDataset(
             repo_id=repo_id,
-            local_files_only=local_files_only,
         )
 
         # ── 依 episode 建立 ReplayBuffer ──────────────────────────────
         replay_buffer = ReplayBuffer.create_empty_numpy()
 
-        episode_data_index = hf_dataset.episode_data_index
-        n_episodes = len(episode_data_index["from"])
+        # lerobot 0.4.x 移除了 episode_data_index；
+        # 改用底層 Arrow dataset（純 tabular，不觸發 torchcodec 影片解碼）。
+        arrow_ds = hf_dataset.hf_dataset
+        all_ep_idx = np.array(arrow_ds["episode_index"])
+        n_episodes = int(hf_dataset.num_episodes)
 
         for ep_idx in range(n_episodes):
-            start = int(episode_data_index["from"][ep_idx])
-            end   = int(episode_data_index["to"][ep_idx])
+            indices = np.where(all_ep_idx == ep_idx)[0]
+            if len(indices) == 0:
+                continue
 
-            obs_frames    = []
-            action_frames = []
+            start = int(indices[0])
+            end   = int(indices[-1]) + 1
 
-            for frame_idx in range(start, end):
-                item = hf_dataset[frame_idx]
+            # 批次切片——比逐行存取快很多
+            ep_slice = arrow_ds[start:end]          # dict of lists
 
-                obs_val    = _to_numpy(item[obs_key])     # (obs_dim,)
-                action_val = _to_numpy(item[action_key])  # (action_dim,)
-
-                obs_frames.append(obs_val)
-                action_frames.append(action_val)
+            obs_arr    = np.array(ep_slice[obs_key],    dtype=np.float32)
+            action_arr = np.array(ep_slice[action_key], dtype=np.float32)
 
             episode = {
-                "obs":    np.stack(obs_frames,    axis=0).astype(np.float32),
-                "action": np.stack(action_frames, axis=0).astype(np.float32),
+                "obs":    obs_arr,
+                "action": action_arr,
             }
             replay_buffer.add_episode(episode)
 

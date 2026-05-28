@@ -1,12 +1,11 @@
 # SAMP_Diff_v1 — PushT lowdim config
 # Based on Freqpolicy pusht.yaml; DiffLoss replaced by Flow Matching + A2A warm-start.
 
-_target_: diffusion_policy.workspace.train_samp_lowdim_workspace.TrainSampLowdimWorkspace
+_target_: diffusion_policy.workspace.train_samp_image_workspace.TrainSampImageWorkspace
 
 action_dim: 2
-obs_dim: 20
 horizon: 16
-n_obs_steps: 2
+n_obs_steps: 4
 n_action_steps: 8
 n_latency_steps: 0
 obs_as_global_cond: true
@@ -51,13 +50,14 @@ logging:
   group: null
   id: null
   mode: offline
-  project: samp_diff_v1
+  project: samp_diff_v3
   entity: null
-  name: train_samp_lowdim_pusht
+  name: train_samp_image_pusht_v3
   resume: true
   tags:
-    - samp_lowdim
-    - pusht_lowdim
+    - samp_image
+    - pusht_image
+    - v3_resnet18
 
 multi_run:
   run_dir: data/outputs/samp_lowdim_pusht
@@ -79,7 +79,7 @@ training:
   resume: true
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 3050
+  num_epochs: 8000
   gradient_accumulate_every: 1
   use_ema: true
   rollout_every: 50
@@ -90,30 +90,45 @@ training:
   max_val_steps: null
   tqdm_interval_sec: 1.0
 
+shape_meta:
+  obs:
+    image:
+      shape: [3, 96, 96]
+      type: rgb
+    agent_pos:
+      shape: [2]
+      type: low_dim
+  action:
+    shape: [2]
+
 policy:
-  _target_: diffusion_policy.policy.samp_lowdim_policy.SampLowdimPolicy
+  _target_: diffusion_policy.policy.samp_image_policy.SampImagePolicy
+
+  # ---- Shape metadata (drives encoder + action dim) ----
+  shape_meta: ${shape_meta}
 
   # ---- Dimensions ----
   horizon: ${horizon}
-  obs_dim: ${obs_dim}
-  action_dim: ${action_dim}
   n_action_steps: ${n_action_steps}
   n_obs_steps: ${n_obs_steps}
 
   # ---- Policy convention ----
-  obs_as_global_cond: ${obs_as_global_cond}
-  obs_as_local_cond: ${obs_as_local_cond}
   pred_action_steps_only: ${pred_action_steps_only}
   oa_step_convention: ${oa_step_convention}
+
+  # ---- Image encoder (ResNet18) ----
+  crop_shape: [76, 76]        # random crop for training augmentation
+  use_group_norm: true
+  imagenet_norm: true
 
   # ---- SampNet Transformer ----
   encoder_embed_dim: 512
   decoder_embed_dim: 512
-  encoder_depth: 4
-  decoder_depth: 4
+  encoder_depth: 6
+  decoder_depth: 6
   encoder_num_heads: 8
   decoder_num_heads: 8
-  mask: true
+  mask: false
   num_iter: 4
 
   # ---- Flow Matching ----
@@ -121,14 +136,22 @@ policy:
   fm_sigma: 0.0               # ConditionalFlowMatcher sigma (0 = straight paths)
 
   # ---- A2A warm-start ----
-  sigma: 0.1                  # noise level added to DCT(prev_action) for x_0
+  sigma: 0.3                  # noise level added to warm-start band
+  cold_start_prob: 0.3        # fraction of training batches that use N(0,I) as x_0
+  freq_split_low: 0           # warm-start band start  (inclusive)
+  freq_split_high: 8          # warm-start band end    (exclusive)
+  sigma_high: 0.2             # noise for out-of-band freqs; <0 = pure N(0,I) (original v2)
+  # sigma_high guide:
+  #   -1.0  → pure random (v2 original, high Discontinuity)
+  #    0.2  → strong memory, target: halve Discontinuity
+  #    0.5  → medium memory
+  #    0.0  → same as sigma (≈ v1 full warm-start)
 
 task:
-  action_dim: ${action_dim}
   dataset:
-    _target_: diffusion_policy.dataset.pusht_dataset.PushTLowdimDataset
+    _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
     horizon: ${horizon}
-    max_train_episodes: 90
+    max_train_episodes: null
     pad_after: 7
     pad_before: 1
     seed: 42
@@ -136,14 +159,14 @@ task:
     zarr_path: data/pusht/pusht_cchi_v7_replay.zarr
 
   env_runner:
-    _target_: diffusion_policy.env_runner.pusht_lowdim_runner.PushTLowdimRunner
+    _target_: diffusion_policy.env_runner.pusht_image_runner.PushTImageRunner
     max_steps: 300
     n_envs: null
     n_obs_steps: ${n_obs_steps}
     n_action_steps: ${n_action_steps}
-    n_latency_steps: ${n_latency_steps}
     fps: 10
     crf: 22
+    render_size: 96
     tqdm_interval_sec: 5.0
     n_train: 6
     n_train_vis: 2

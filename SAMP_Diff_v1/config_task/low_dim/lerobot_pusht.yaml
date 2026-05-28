@@ -6,10 +6,10 @@
 _target_: diffusion_policy.workspace.train_samp_lowdim_workspace.TrainSampLowdimWorkspace
 
 # ── 維度 ─────────────────────────────────────────────────────────────
-# PushT: state=[agent_pos(2), block_pos(2), block_angle(1)] → obs_dim=5
-#        action=[velocity_x, velocity_y]                   → action_dim=2
+# PushT (lerobot 0.4.x): observation.state=[agent_pos_x, agent_pos_y] → obs_dim=2
+#                        action=[velocity_x, velocity_y]              → action_dim=2
 action_dim: 2
-obs_dim: 5
+obs_dim: 2
 horizon: 16
 n_obs_steps: 2
 n_action_steps: 8
@@ -55,7 +55,7 @@ exp_name: default
 logging:
   group: null
   id: null
-  mode: offline
+  mode: online
   project: samp_diff_v1
   entity: null
   name: train_samp_lowdim_lerobot_pusht
@@ -88,7 +88,7 @@ training:
   num_epochs: 2050
   gradient_accumulate_every: 1
   use_ema: true
-  rollout_every: 50
+  rollout_every: 500
   checkpoint_every: 50
   val_every: 1
   sample_every: 5
@@ -125,6 +125,7 @@ policy:
 
   # A2A warm-start
   sigma: 0.1
+  cold_start_prob: 0.2   # 20% samples use N(0,I) x_0 to match first-step inference
 
 task:
   repo_id: lerobot/pusht
@@ -146,10 +147,12 @@ task:
     _target_: diffusion_policy.env_runner.lerobot_lowdim_runner.LeRobotLowdimRunner
     gym_env_id: gym_pusht/PushT-v0
     obs_key: ${task.obs_key}
-    n_test: 50
-    max_steps: 500
+    obs_dim: ${obs_dim}
+    n_test: 20
+    max_steps: 300
     n_obs_steps: ${n_obs_steps}
     n_action_steps: ${n_action_steps}
     fps: 10
     tqdm_interval_sec: 1.0
+    device: cuda:0
     output_dir: ${hydra:runtime.output_dir}

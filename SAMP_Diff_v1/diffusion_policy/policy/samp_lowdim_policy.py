@@ -64,6 +64,10 @@ class SampLowdimPolicy(BaseLowdimPolicy):
         num_inference_steps: int = 6,
         sigma: float = 0.1,
         fm_sigma: float = 0.0,
+        cold_start_prob: float = 0.2,
+        freq_split_low: int = 0,
+        freq_split_high: int = 4,
+        sigma_high: float = -1.0,
         # Policy convention flags
         obs_as_global_cond: bool = True,
         obs_as_local_cond: bool = False,
@@ -88,6 +92,7 @@ class SampLowdimPolicy(BaseLowdimPolicy):
         self.oa_step_convention = oa_step_convention
         self.num_inference_steps = num_inference_steps
         self.sigma = sigma
+        self.cold_start_prob = cold_start_prob
 
         # condition dimension = To * obs_dim (flattened obs window)
         condition_dim = n_obs_steps * obs_dim
@@ -107,6 +112,9 @@ class SampLowdimPolicy(BaseLowdimPolicy):
             mask=mask,
             num_iter=num_iter,
             sigma=sigma,
+            freq_split_low=freq_split_low,
+            freq_split_high=freq_split_high,
+            sigma_high=sigma_high,
             norm_layer=partial(nn.LayerNorm, eps=1e-6),
         )
 
@@ -243,5 +251,6 @@ class SampLowdimPolicy(BaseLowdimPolicy):
             actions_gt=trajectory,
             prev_actions=prev_actions,
             global_cond=global_cond,
+            cold_start_prob=self.cold_start_prob,
         )
         return loss

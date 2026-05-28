@@ -14,7 +14,7 @@ h5py==3.7.0
 dill==0.3.5.1
 
 # ── 影像 / 視覺 ───────────────────────────────────────────────
-opencv-python==4.6.0.66
+#opencv-python==4.6.0.66
 scikit-image==0.19.3
 scikit-video==1.1.11
 imageio==2.22.0
