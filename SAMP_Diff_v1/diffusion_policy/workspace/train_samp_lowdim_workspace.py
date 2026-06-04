@@ -270,6 +270,7 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
 
                 # checkpoint
                 if self.epoch % cfg.training.checkpoint_every == 0:
+                    print("[DEBUG] step_log keys:", list(step_log.keys()))
                     mean_test_score = step_log.get("test/mean_score", 0.0)
                     mean_train_score = step_log.get("train/mean_score", 0.0)
                     self.save_checkpoint(
@@ -283,9 +284,13 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
                         self.save_snapshot()
 
                     metric_dict = {k.replace('/', '_'): v for k, v in step_log.items()}
-                    topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
-                    if topk_ckpt_path is not None:
-                        self.save_checkpoint(path=topk_ckpt_path)
+                    monitor_key = cfg.checkpoint.topk.monitor_key
+                    if monitor_key not in metric_dict:
+                        print(f"[WARN] monitor_key {monitor_key} not in metric_dict, skip topk checkpoint.")
+                    else:
+                        topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
+                        if topk_ckpt_path is not None:
+                            self.save_checkpoint(path=topk_ckpt_path)
 
                 # end of epoch bookkeeping
                 wandb_run.log(step_log, step=self.global_step)

@@ -33,6 +33,33 @@ from gym.vector.utils import (
 __all__ = ["AsyncVectorEnv"]
 
 
+def _concatenate_observations(space, items, out):
+    """Call Gym's concatenate across old/new argument orders."""
+    try:
+        # Gym >= 0.26 uses: concatenate(items, out, space)
+        return concatenate(items, out, space)
+    except (AssertionError, TypeError, ValueError):
+        pass
+    try:
+        # Some Gym/Numpy combinations reject the preallocated output buffer.
+        return concatenate(items, None, space)
+    except (AssertionError, TypeError, ValueError):
+        pass
+    try:
+        # Older Gym uses: concatenate(space, items, out)
+        return concatenate(space, items, out)
+    except ValueError:
+        return concatenate(space, items, None)
+
+
+def _send_worker_error(pipe, index, error_queue):
+    error_queue.put((index,) + sys.exc_info()[:2])
+    try:
+        pipe.send((None, False))
+    except (BrokenPipeError, EOFError, OSError):
+        pass
+
+
 class AsyncState(Enum):
     DEFAULT = "default"
     WAITING_RESET = "reset"
@@ -230,7 +257,7 @@ class AsyncVectorEnv(VectorEnv):
         self._state = AsyncState.DEFAULT
 
         if not self.shared_memory:
-            self.observations = concatenate(
+            self.observations = _concatenate_observations(
                 self.single_observation_space, results, self.observations
             )
 
@@ -293,7 +320,7 @@ class AsyncVectorEnv(VectorEnv):
         observations_list, rewards, dones, infos = zip(*results)
 
         if not self.shared_memory:
-            self.observations = concatenate(
+            self.observations = _concatenate_observations(
                 self.single_observation_space, observations_list, self.observations
             )
 
@@ -605,9 +632,10 @@ def _worker(index, env_fn, pipe, parent_pipe, shared_memory, error_queue):
                     "be one of {`reset`, `step`, `seed`, `close`, "
                     "`_check_observation_space`}.".format(command)
                 )
+    except EOFError:
+        pass
     except (KeyboardInterrupt, Exception):
-        error_queue.put((index,) + sys.exc_info()[:2])
-        pipe.send((None, False))
+        _send_worker_error(pipe, index, error_queue)
     finally:
         env.close()
 
@@ -664,8 +692,9 @@ def _worker_shared_memory(index, env_fn, pipe, parent_pipe, shared_memory, error
                     "be one of {`reset`, `step`, `seed`, `close`, "
                     "`_check_observation_space`}.".format(command)
                 )
+    except EOFError:
+        pass
     except (KeyboardInterrupt, Exception):
-        error_queue.put((index,) + sys.exc_info()[:2])
-        pipe.send((None, False))
+        _send_worker_error(pipe, index, error_queue)
     finally:
         env.close()

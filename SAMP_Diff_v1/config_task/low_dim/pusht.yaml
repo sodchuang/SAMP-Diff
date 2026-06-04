@@ -1,9 +1,10 @@
 # SAMP_Diff_v1 — PushT lowdim config
 # Based on Freqpolicy pusht.yaml; DiffLoss replaced by Flow Matching + A2A warm-start.
 
-_target_: diffusion_policy.workspace.train_samp_image_workspace.TrainSampImageWorkspace
+_target_: diffusion_policy.workspace.train_samp_lowdim_workspace.TrainSampLowdimWorkspace
 
 action_dim: 2
+obs_dim: 20
 horizon: 16
 n_obs_steps: 4
 n_action_steps: 8
@@ -50,14 +51,14 @@ logging:
   group: null
   id: null
   mode: offline
-  project: samp_diff_v3
+  project: samp_diff_v2
   entity: null
-  name: train_samp_image_pusht_v3
+  name: train_samp_lowdim_pusht_v2
   resume: true
   tags:
-    - samp_image
-    - pusht_image
-    - v3_resnet18
+    - samp_lowdim
+    - pusht_lowdim
+    - v2_freq_split
 
 multi_run:
   run_dir: data/outputs/samp_lowdim_pusht
@@ -90,36 +91,21 @@ training:
   max_val_steps: null
   tqdm_interval_sec: 1.0
 
-shape_meta:
-  obs:
-    image:
-      shape: [3, 96, 96]
-      type: rgb
-    agent_pos:
-      shape: [2]
-      type: low_dim
-  action:
-    shape: [2]
-
 policy:
-  _target_: diffusion_policy.policy.samp_image_policy.SampImagePolicy
-
-  # ---- Shape metadata (drives encoder + action dim) ----
-  shape_meta: ${shape_meta}
+  _target_: diffusion_policy.policy.samp_lowdim_policy.SampLowdimPolicy
 
   # ---- Dimensions ----
   horizon: ${horizon}
+  obs_dim: ${obs_dim}
+  action_dim: ${action_dim}
   n_action_steps: ${n_action_steps}
   n_obs_steps: ${n_obs_steps}
 
   # ---- Policy convention ----
+  obs_as_global_cond: ${obs_as_global_cond}
+  obs_as_local_cond: ${obs_as_local_cond}
   pred_action_steps_only: ${pred_action_steps_only}
   oa_step_convention: ${oa_step_convention}
-
-  # ---- Image encoder (ResNet18) ----
-  crop_shape: [76, 76]        # random crop for training augmentation
-  use_group_norm: true
-  imagenet_norm: true
 
   # ---- SampNet Transformer ----
   encoder_embed_dim: 512
@@ -148,8 +134,9 @@ policy:
   #    0.0  → same as sigma (≈ v1 full warm-start)
 
 task:
+  action_dim: ${action_dim}
   dataset:
-    _target_: diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset
+    _target_: diffusion_policy.dataset.pusht_dataset.PushTLowdimDataset
     horizon: ${horizon}
     max_train_episodes: null
     pad_after: 7
@@ -159,14 +146,14 @@ task:
     zarr_path: data/pusht/pusht_cchi_v7_replay.zarr
 
   env_runner:
-    _target_: diffusion_policy.env_runner.pusht_image_runner.PushTImageRunner
+    _target_: diffusion_policy.env_runner.pusht_keypoints_runner.PushTKeypointsRunner
     max_steps: 300
     n_envs: null
     n_obs_steps: ${n_obs_steps}
     n_action_steps: ${n_action_steps}
+    n_latency_steps: ${n_latency_steps}
     fps: 10
     crf: 22
-    render_size: 96
     tqdm_interval_sec: 5.0
     n_train: 6
     n_train_vis: 2
