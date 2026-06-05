@@ -40,8 +40,10 @@
 
 ## 系統架構圖 (System Architecture)
 ---
-![flow](./low-dimm-SAMP-Difff_flow.jpg)
+![flow](./low-dim-SAMP-Diff-flow.jpg)
+
 ![training flow](./train_path(1).png)
+
 ---
 
 ## 技術基準對比 (Literature Review)
