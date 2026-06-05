@@ -39,71 +39,9 @@
 ---
 
 ## 系統架構圖 (System Architecture)
-
-```mermaid
-graph TB
-    subgraph INPUT["輸入層"]
-        OBS["觀測 o_t\nstate (B, T_o, obs_dim)"]
-        PREV["前一動作 A_prev\n(B, H, Da)\n★ A2A warm-start buffer"]
-    end
-
-    subgraph ENCODER["條件編碼器"]
-        OBS --> OBSENC["obs_encoder\nLinear 投影"]
-        OBSENC --> COND["global_cond c\n(B, T_o × obs_dim)"]
-    end
-
-    subgraph FREQ["頻域變換 (DCT)"]
-        PREV --> DCT_P["DCT(A_prev)"]
-        DCT_P --> X0["x_0 = F_prev + σ·ε\n★ 知情初始化"]
-        GT["GT 動作 A (訓練)"] --> DCT_GT["DCT(A) = x_1"]
-    end
-
-    subgraph SAMPNET["SampNet — MAE Transformer"]
-        direction TB
-        TEMB["time_proj  t → t_emb\n正弦位置編碼"]
-        TOK["token_embed\nx_t tokens"]
-        ENC["Transformer Encoder × L\nBasicTransformerBlock\ncross-attn 注入 c"]
-        DEC["Transformer Decoder × L"]
-        FHEAD["flow_head\nLinear→SiLU→Linear"]
-        VPRED["v_pred  (B, H, Da)"]
-        TOK --> ENC
-        TEMB --> ENC
-        ENC --> DEC
-        DEC --> FHEAD
-        FHEAD --> VPRED
-    end
-
-    subgraph LOSS_OR_ODE["訓練 / 推論分支"]
-        direction LR
-        TRAIN["訓練\nx_t = (1-t)x_0 + t·x_1\nu = x_1 − x_0\nL = ‖v_pred − u‖²"]
-        INFER["推論 Euler 6 步\nx_{t+dt} = x_t + dt·v_pred\n僅需 6 次 forward pass"]
-    end
-
-    subgraph OUTPUT["輸出"]
-        X1["頻域結果 x_1"]
-        IDCT["iDCT"]
-        ACTION["動作 A_t\n(B, n_action_steps, Da)\n→ 存回 A_prev"]
-    end
-
-    COND --> ENC
-    X0 --> TOK
-    X0 --> TRAIN
-    DCT_GT --> TRAIN
-    VPRED --> TRAIN
-    VPRED --> INFER
-    INFER --> X1
-    X1 --> IDCT
-    IDCT --> ACTION
-    ACTION --> PREV
-
-    style INPUT fill:#e8f4fd,stroke:#4a90d9
-    style ENCODER fill:#fff9e6,stroke:#f0a500
-    style FREQ fill:#e8f8e8,stroke:#4caf50
-    style SAMPNET fill:#f3e5f5,stroke:#9c27b0
-    style LOSS_OR_ODE fill:#fce4ec,stroke:#e91e63
-    style OUTPUT fill:#e0f2f1,stroke:#009688
-```
-
+---
+![flow](low-dimm-SAMP-Difff_flow.jpg)
+![training flow](train_path(1).png)
 ---
 
 ## 技術基準對比 (Literature Review)
