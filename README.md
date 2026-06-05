@@ -40,8 +40,8 @@
 
 ## 系統架構圖 (System Architecture)
 ---
-![flow](low-dimm-SAMP-Difff_flow.jpg)
-![training flow](train_path(1).png)
+![flow](./low-dimm-SAMP-Difff_flow.jpg)
+![training flow](./train_path(1).png)
 ---
 
 ## 技術基準對比 (Literature Review)
@@ -56,89 +56,6 @@
 | A2A Flow Matching | 時域 | 10 | ✓ | ✗ |
 | FreqPolicy | 頻域 | 50 | ✗ | ✓ |
 | **SAMP-Diff v1（本研究）** | **頻域** | **6** | **✓** | **✓** |
-
----
-
-## 訓練流程圖 (Training Pipeline)
-
-```mermaid
-flowchart LR
-    subgraph DATA["資料準備"]
-        DS["LeRobot / Robomimic\nHuggingFace Hub / HDF5"]
-        NORM["LinearNormalizer  [-1, 1]"]
-        DS --> NORM
-    end
-
-    subgraph BUILD["先驗建構 (A2A warm-start)"]
-        NORM --> OBS_T["obs (B, T_o, obs_dim)"]
-        NORM --> ACT_T["action (B, H, Da)"]
-        ACT_T --> SHIFT["shift → prev_action"]
-        SHIFT --> DCT_PREV["DCT(prev_action)"]
-        DCT_PREV --> X0T["x_0 = DCT_prev + σ·ε"]
-        ACT_T --> DCT_ACT["DCT(action) = x_1"]
-    end
-
-    subgraph FM["Flow Matching"]
-        X0T --> INTERP["x_t = (1-t)·x_0 + t·x_1\nu = x_1 − x_0"]
-        DCT_ACT --> INTERP
-    end
-
-    subgraph MODEL["SampNet Forward"]
-        OBS_T --> OBSENC2["obs_encoder → global_cond"]
-        INTERP --> SAMP["MAE Transformer + flow_head"]
-        OBSENC2 --> SAMP
-        SAMP --> VPT["v_pred"]
-    end
-
-    subgraph OPTIM["最佳化"]
-        VPT --> LOSS["L = ‖v_pred − u‖²"]
-        LOSS --> BACK["AdamW + cosine LR + EMA"]
-    end
-
-    style DATA fill:#e8f4fd,stroke:#4a90d9
-    style BUILD fill:#fff3e0,stroke:#f5a623
-    style FM fill:#e8f8e8,stroke:#4caf50
-    style MODEL fill:#f3e5f5,stroke:#9c27b0
-    style OPTIM fill:#fce4ec,stroke:#e91e63
-```
-
----
-
-## 推論流程圖 (Inference Pipeline)
-
-```mermaid
-flowchart LR
-    subgraph ENV["環境 (MuJoCo / LeRobot Gym)"]
-        OT["觀測 o_t  (state ± image)"]
-        EXEC["執行動作  8 steps / call"]
-    end
-
-    subgraph WARM["A2A 初始化"]
-        BUF["warm-start buffer  A_prev"]
-        BUF --> DCT2["DCT(A_prev) + σ·ε = x_0"]
-        INIT["第一幀: x_0 ~ N(0,I)"]
-    end
-
-    subgraph ODE["Euler ODE  6 步"]
-        OT --> COND2["obs_encoder → c"]
-        DCT2 --> EULER["x_{t+dt} = x_t + dt · v_θ(x_t, t, c)"]
-        COND2 --> EULER
-        EULER --> X1OUT["x_1"]
-    end
-
-    subgraph DECODE["解碼"]
-        X1OUT --> IDCT2["iDCT → actions (B, H, Da)"]
-        IDCT2 --> SLICE["slice [:, T_o-1 : T_o-1+8]"]
-    end
-
-    SLICE --> EXEC
-    SLICE --> BUF
-
-    style ENV fill:#e8f4fd,stroke:#4a90d9
-    style WARM fill:#fff3e0,stroke:#f5a623
-    style ODE fill:#e8f8e8,stroke:#4caf50
-    style DECODE fill:#f3e5f5,stroke:#9c27b0
-```
 
 ---
 
