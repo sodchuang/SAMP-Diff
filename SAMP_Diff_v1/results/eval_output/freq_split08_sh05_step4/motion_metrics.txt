@@ -1,0 +1,18 @@
+[SampLowdimPolicy] SampNet trainable params: 64.2M
+pygame 2.1.2 (SDL 2.0.16, Python 3.10.8)
+Hello from the pygame community. https://www.pygame.org/contribute.html
+Evaluating 50 episodes (seed 100000 … 100049) ...
+  ep  10/50  score=0.967  path=9781.7 px  jerk=1.441e+10  disc=36.504 px
+  ep  20/50  score=0.998  path=9306.2 px  jerk=1.547e+10  disc=34.810 px
+  ep  30/50  score=0.912  path=11268.4 px  jerk=2.469e+10  disc=44.149 px
+  ep  40/50  score=1.000  path=4507.9 px  jerk=1.672e+10  disc=27.848 px
+  ep  50/50  score=0.964  path=8221.9 px  jerk=1.107e+10  disc=27.802 px
+
+=================================================================
+Metric                               Mean           Std
+-----------------------------------------------------------------
+Mean Score (coverage)              0.9589        0.0873
+Path Length (px)                  8293.09       2311.95
+Jerk Cost (px/s^3)^2           1.6509e+10    4.8471e+09
+Discontinuity (px)                32.0572        5.5639
+=================================================================
