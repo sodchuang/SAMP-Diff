@@ -1,0 +1,170 @@
+# SAMP_Diff_v1 — Robomimic Square PH (MuJoCo)
+# 夾爪將螺帽套入螺柱；obs_dim=23
+
+_target_: diffusion_policy.workspace.train_samp_lowdim_workspace.TrainSampLowdimWorkspace
+
+action_dim: 10
+obs_dim: 23
+horizon: 16
+n_obs_steps: 2
+n_action_steps: 8
+n_latency_steps: 0
+obs_as_global_cond: true
+obs_as_local_cond: false
+pred_action_steps_only: false
+oa_step_convention: true
+
+data_split:
+  val_ratio: 0.02
+  seed: 42
+  max_train_episodes: null
+
+checkpoint:
+  save_last_ckpt: true
+  save_last_snapshot: false
+  topk:
+    format_str: epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt
+    k: 5
+    mode: max
+    monitor_key: test_mean_score
+
+dataloader:
+  batch_size: 256
+  num_workers: 4
+  persistent_workers: false
+  pin_memory: true
+  shuffle: true
+
+val_dataloader:
+  batch_size: 256
+  num_workers: 4
+  persistent_workers: false
+  pin_memory: true
+  shuffle: false
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  inv_gamma: 1.0
+  max_value: 0.9999
+  min_value: 0.0
+  power: 0.75
+  update_after_step: 0
+
+exp_name: default
+
+logging:
+  group: null
+  id: null
+  mode: offline
+  project: samp_diff_v1
+  entity: null
+  name: train_samp_square_ph
+  resume: true
+  tags: [samp_lowdim, square_lowdim, mujoco]
+
+multi_run:
+  run_dir: data/outputs/samp_lowdim_square_ph
+  wandb_name_base: samp_lowdim_square_ph
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.95, 0.999]
+  eps: 1.0e-08
+  lr: 0.0001
+  weight_decay: 1.0e-06
+
+training:
+  device: cuda:0
+  seed: ${data_split.seed}
+  debug: false
+  resume: true
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 4550
+  gradient_accumulate_every: 1
+  use_ema: true
+  rollout_every: 50
+  checkpoint_every: 50
+  val_every: 1
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+policy:
+  _target_: diffusion_policy.policy.samp_lowdim_policy.SampLowdimPolicy
+  horizon: ${horizon}
+  obs_dim: ${obs_dim}
+  action_dim: ${action_dim}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+  obs_as_global_cond: ${obs_as_global_cond}
+  obs_as_local_cond: ${obs_as_local_cond}
+  pred_action_steps_only: ${pred_action_steps_only}
+  oa_step_convention: ${oa_step_convention}
+  encoder_embed_dim: 512
+  decoder_embed_dim: 512
+  encoder_depth: 4
+  decoder_depth: 4
+  encoder_num_heads: 8
+  decoder_num_heads: 8
+  mask: true
+  num_iter: 4
+  num_inference_steps: 6
+  fm_sigma: 0.0
+  # v2c 6-step spectral warm-start
+  sigma: 0.3
+  cold_start_prob: 0.3
+  freq_split_low: 0
+  freq_split_high: 8
+  sigma_high: 0.2
+
+task:
+  abs_action: true
+  action_dim: ${action_dim}
+  dataset_path: data/robomimic/datasets/square/ph/low_dim_abs.hdf5
+  dataset_type: ph
+
+  dataset:
+    _target_: diffusion_policy.dataset.robomimic_replay_lowdim_dataset.RobomimicReplayLowdimDataset
+    abs_action: true
+    dataset_path: ${task.dataset_path}
+    horizon: ${horizon}
+    obs_keys:
+      - object
+      - robot0_eef_pos
+      - robot0_eef_quat
+      - robot0_gripper_qpos
+    pad_after: 7
+    pad_before: 1
+    rotation_rep: rotation_6d
+    seed: ${data_split.seed}
+    val_ratio: ${data_split.val_ratio}
+    max_train_episodes: ${data_split.max_train_episodes}
+    use_legacy_normalizer: false
+
+  env_runner:
+    _target_: diffusion_policy.env_runner.robomimic_lowdim_runner.RobomimicLowdimRunner
+    abs_action: true
+    crf: 22
+    dataset_path: ${task.dataset_path}
+    fps: 10
+    max_steps: 400
+    n_action_steps: ${n_action_steps}
+    n_envs: 28
+    n_latency_steps: ${n_latency_steps}
+    n_obs_steps: ${n_obs_steps}
+    n_test: 50
+    n_test_vis: 4
+    n_train: 6
+    n_train_vis: 2
+    obs_keys:
+      - object
+      - robot0_eef_pos
+      - robot0_eef_quat
+      - robot0_gripper_qpos
+    past_action: false
+    render_hw: [128, 128]
+    test_start_seed: 100000
+    train_start_idx: 0
+    output_dir: ${hydra:runtime.output_dir}
