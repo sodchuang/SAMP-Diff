@@ -19,6 +19,20 @@ obs_as_local_cond: false
 pred_action_steps_only: false
 oa_step_convention: true
 
+task_semantics:
+  domain: lerobot_pusht
+  task_name: lerobot_pusht_lowdim
+  control_mode: planar_position
+  action_representation: xy_position
+  action_groups:
+    xy_position: [0, 1]
+  routing:
+    spectral: [0, 1]
+    direct: []
+  diagnostics:
+    smooth_groups:
+      xy_position: [0, 1]
+
 checkpoint:
   save_last_ckpt: true
   save_last_snapshot: false
@@ -126,6 +140,9 @@ policy:
   # A2A warm-start
   sigma: 0.1
   cold_start_prob: 0.2   # 20% samples use N(0,I) x_0 to match first-step inference
+  freq_split_low: 0
+  freq_split_high: 8
+  sigma_high: 0.1
 
 task:
   repo_id: lerobot/pusht

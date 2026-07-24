@@ -1,10 +1,7 @@
-# SAMP_Diff_v1 — Robomimic Can PH (MuJoCo)
-# 夾爪撿鋁罐放入桶中；obs_dim=23（含物件 quat → rot6d 擴充）
-
 _target_: diffusion_policy.workspace.train_samp_lowdim_workspace.TrainSampLowdimWorkspace
 
-action_dim: 10        # eef_pos(3) + eef_rot6d(6) + gripper(1)
-obs_dim: 23           # object(7) + eef_pos(3) + eef_rot6d(6) + gripper_qpos(2) + extra(5) → rot6d 展開後
+action_dim: 10
+obs_dim: 23
 horizon: 16
 n_obs_steps: 2
 n_action_steps: 8
@@ -14,12 +11,30 @@ obs_as_local_cond: false
 pred_action_steps_only: false
 oa_step_convention: true
 
-# ── 資料集分割 (Data Split) ─────────────────────────────────────
-# train : val = 98% : 2%  （約 195 : 5 episodes for ph/200-demo）
+task_semantics:
+  domain: robomimic
+  task_name: can_ph
+  control_mode: abs_eef_pose
+  action_representation: xyz_rotation6d_gripper
+  action_groups:
+    translation: [0, 1, 2]
+    rotation: [3, 4, 5, 6, 7, 8]
+    gripper: [9]
+  routing:
+    spectral: [0, 1, 2]
+    direct: [3, 4, 5, 6, 7, 8, 9]
+  diagnostics:
+    smooth_groups:
+      xyz: [0, 1, 2]
+    rotation_groups:
+      rotation: [3, 4, 5, 6, 7, 8]
+    contact_groups:
+      gripper: [9]
+
 data_split:
   val_ratio: 0.02
   seed: 42
-  max_train_episodes: null   # null = 使用全部訓練集，可設整數限制
+  max_train_episodes: null
 
 checkpoint:
   save_last_ckpt: true
@@ -58,18 +73,15 @@ logging:
   group: null
   id: null
   mode: offline
-  project: samp_diff_v1
+  project: samp_diff_robomimic_v2c
   entity: null
-  name: train_samp_can_ph
+  name: samp_diff_can_ph_v2c_step6
   resume: true
-  tags:
-    - samp_lowdim
-    - can_lowdim
-    - mujoco
+  tags: [samp_lowdim, robomimic, can, ph, v2c_step6]
 
 multi_run:
-  run_dir: data/outputs/samp_lowdim_can_ph
-  wandb_name_base: samp_lowdim_can_ph
+  run_dir: data/outputs/robomimic/can_ph
+  wandb_name_base: samp_diff_can_ph_v2c_step6
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -85,7 +97,7 @@ training:
   resume: true
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 4550
+  num_epochs: 6000
   gradient_accumulate_every: 1
   use_ema: true
   rollout_every: 50
@@ -117,29 +129,39 @@ policy:
   num_iter: 4
   num_inference_steps: 6
   fm_sigma: 0.0
-  # v2c 6-step spectral warm-start
   sigma: 0.3
   cold_start_prob: 0.3
   freq_split_low: 0
   freq_split_high: 8
   sigma_high: 0.2
+  action_group_spectral_params:
+    translation:
+      indices: [0, 1, 2]
+      freq_split_high: 8
+      sigma: 0.3
+      sigma_high: 0.2
+    rotation:
+      indices: [3, 4, 5, 6, 7, 8]
+      freq_split_high: 12
+      sigma: 0.25
+      sigma_high: 0.3
+    gripper:
+      indices: [9]
+      freq_split_high: 16
+      sigma: 0.5
+      sigma_high: 0.5
 
 task:
   abs_action: true
   action_dim: ${action_dim}
   dataset_path: data/robomimic/datasets/can/ph/low_dim_abs.hdf5
   dataset_type: ph
-
   dataset:
     _target_: diffusion_policy.dataset.robomimic_replay_lowdim_dataset.RobomimicReplayLowdimDataset
     abs_action: true
     dataset_path: ${task.dataset_path}
     horizon: ${horizon}
-    obs_keys:
-      - object
-      - robot0_eef_pos
-      - robot0_eef_quat
-      - robot0_gripper_qpos
+    obs_keys: [object, robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos]
     pad_after: 7
     pad_before: 1
     rotation_rep: rotation_6d
@@ -147,7 +169,6 @@ task:
     val_ratio: ${data_split.val_ratio}
     max_train_episodes: ${data_split.max_train_episodes}
     use_legacy_normalizer: false
-
   env_runner:
     _target_: diffusion_policy.env_runner.robomimic_lowdim_runner.RobomimicLowdimRunner
     abs_action: true
@@ -163,11 +184,7 @@ task:
     n_test_vis: 4
     n_train: 6
     n_train_vis: 2
-    obs_keys:
-      - object
-      - robot0_eef_pos
-      - robot0_eef_quat
-      - robot0_gripper_qpos
+    obs_keys: [object, robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos]
     past_action: false
     render_hw: [128, 128]
     test_start_seed: 100000

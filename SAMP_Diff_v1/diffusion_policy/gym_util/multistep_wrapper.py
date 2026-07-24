@@ -160,3 +160,8 @@ class MultiStepWrapper(gym.Wrapper):
         for k, v in self.info.items():
             result[k] = list(v)
         return result
+
+    def get_tool_hang_stage_flags(self):
+        # Explicit delegation keeps this callable through AsyncVectorEnv even
+        # with VideoRecordingWrapper between this wrapper and the task.
+        return self.env.get_tool_hang_stage_flags()

@@ -5,7 +5,6 @@ import torch
 import collections
 import pathlib
 import tqdm
-import h5py
 import dill
 import math
 import wandb.sdk.data_types.video as wv
@@ -19,12 +18,12 @@ from diffusion_policy.policy.base_lowdim_policy import BaseLowdimPolicy
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.env_runner.base_lowdim_runner import BaseLowdimRunner
 from diffusion_policy.env.robomimic.robomimic_lowdim_wrapper import RobomimicLowdimWrapper
-import robomimic.utils.file_utils as FileUtils
-import robomimic.utils.env_utils as EnvUtils
-import robomimic.utils.obs_utils as ObsUtils
 
 
 def create_env(env_meta, obs_keys):
+    import robomimic.utils.env_utils as EnvUtils
+    import robomimic.utils.obs_utils as ObsUtils
+
     ObsUtils.initialize_obs_modality_mapping_from_dict(
         {'low_dim': obs_keys})
     env = EnvUtils.create_env_from_metadata(
@@ -64,6 +63,13 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
             crf=22,
             past_action=False,
             abs_action=False,
+            action_clip_by_dataset=False,
+            action_clip_margin_scale=0.25,
+            action_clip_min_margin=0.05,
+            tool_hang_lift_delta=0.03,
+            tool_hang_hold_steps=10,
+            tool_hang_insert_hold_steps=10,
+            tool_hang_full_hold_steps=10,
             tqdm_interval_sec=5.0,
             n_envs=None
         ):
@@ -101,6 +107,15 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
         robosuite_fps = 20
         steps_per_render = max(robosuite_fps // fps, 1)
 
+        try:
+            import h5py
+            import robomimic.utils.file_utils as FileUtils
+        except ImportError as e:
+            raise ImportError(
+                "RobomimicLowdimRunner requires h5py and robomimic. "
+                "Install them in the training environment before rollout."
+            ) from e
+
         # read from dataset
         env_meta = FileUtils.get_env_metadata_from_dataset(
             dataset_path)
@@ -108,6 +123,19 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
         if abs_action:
             env_meta['env_kwargs']['controller_configs']['control_delta'] = False
             rotation_transformer = RotationTransformer('axis_angle', 'rotation_6d')
+
+        self.action_clip_by_dataset = bool(action_clip_by_dataset)
+        self.action_clip_min = None
+        self.action_clip_max = None
+        self._action_clip_warned = False
+        if self.action_clip_by_dataset:
+            action_min, action_max = self._get_dataset_action_bounds(
+                dataset_path=dataset_path,
+                margin_scale=action_clip_margin_scale,
+                min_margin=action_clip_min_margin,
+            )
+            self.action_clip_min = action_min
+            self.action_clip_max = action_max
 
         def env_fn():
             robomimic_env = create_env(
@@ -123,7 +151,11 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
                             obs_keys=obs_keys,
                             init_state=None,
                             render_hw=render_hw,
-                            render_camera_name=render_camera_name
+                            render_camera_name=render_camera_name,
+                            tool_hang_lift_delta=tool_hang_lift_delta,
+                            tool_hang_hold_steps=tool_hang_hold_steps,
+                            tool_hang_insert_hold_steps=tool_hang_insert_hold_steps,
+                            tool_hang_full_hold_steps=tool_hang_full_hold_steps,
                         ),
                         video_recoder=VideoRecorder.create_h264(
                             fps=fps,
@@ -225,6 +257,65 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
         self.abs_action = abs_action
         self.tqdm_interval_sec = tqdm_interval_sec
 
+    def recover_after_worker_error(self):
+        """Replace a broken AsyncVectorEnv after a simulator worker exits.
+
+        MuJoCo warnings such as an unstable QACC terminate the affected worker.
+        That vector environment cannot be reused, but training can safely
+        continue after all remaining workers are terminated and recreated.
+        """
+        old_env = self.env
+        try:
+            old_env.close_extras(terminate=True)
+        except Exception as exc:
+            print(f"[WARN] Failed to fully close broken rollout workers: {exc}")
+        self.env = AsyncVectorEnv(self.env_fns)
+        print("[WARN] Recreated rollout environments after worker failure.")
+
+    @staticmethod
+    def _get_dataset_action_bounds(dataset_path, margin_scale=0.25, min_margin=0.05):
+        import h5py
+
+        mins = list()
+        maxs = list()
+        with h5py.File(dataset_path, 'r') as f:
+            for demo in f['data'].values():
+                actions = demo['actions'][:].astype(np.float32)
+                mins.append(np.min(actions, axis=0))
+                maxs.append(np.max(actions, axis=0))
+
+        action_min = np.min(np.stack(mins, axis=0), axis=0)
+        action_max = np.max(np.stack(maxs, axis=0), axis=0)
+        action_range = action_max - action_min
+        margin = np.maximum(action_range * float(margin_scale), float(min_margin))
+        return action_min - margin, action_max + margin
+
+    def _sanitize_env_action(self, env_action):
+        if not np.all(np.isfinite(env_action)):
+            if self.action_clip_min is None:
+                print(env_action)
+                raise RuntimeError("Nan or Inf env action")
+            env_action = np.nan_to_num(
+                env_action,
+                nan=0.0,
+                posinf=np.max(self.action_clip_max),
+                neginf=np.min(self.action_clip_min),
+            )
+
+        if self.action_clip_min is None:
+            return env_action
+
+        clipped = np.clip(env_action, self.action_clip_min, self.action_clip_max)
+        if (not self._action_clip_warned) and np.any(clipped != env_action):
+            before_min = np.min(env_action, axis=(0, 1))
+            before_max = np.max(env_action, axis=(0, 1))
+            print(
+                "[WARN] RobomimicLowdimRunner clipped env action outside "
+                f"dataset bounds. min={before_min}, max={before_max}"
+            )
+            self._action_clip_warned = True
+        return clipped
+
     def run(self, policy: BaseLowdimPolicy):
         device = policy.device
         dtype = policy.dtype
@@ -238,6 +329,7 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
         # allocate data
         all_video_paths = [None] * n_inits
         all_rewards = [None] * n_inits
+        all_stage_flags = [None] * n_inits
 
         for chunk_idx in range(n_chunks):
             start = chunk_idx * n_envs
@@ -301,6 +393,7 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
                 env_action = action
                 if self.abs_action:
                     env_action = self.undo_transform_action(action)
+                env_action = self._sanitize_env_action(env_action)
 
                 obs, reward, done, info = env.step(env_action)
                 done = np.all(done)
@@ -313,10 +406,36 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
             # collect data for this round
             all_video_paths[this_global_slice] = env.render()[this_local_slice]
             all_rewards[this_global_slice] = env.call('get_attr', 'reward')[this_local_slice]
+            all_stage_flags[this_global_slice] = env.call(
+                'get_tool_hang_stage_flags')[this_local_slice]
 
         # log
         max_rewards = collections.defaultdict(list)
+        final_rewards = collections.defaultdict(list)
+        stable_rewards = collections.defaultdict(list)
+        stage_results = {
+            'grasp': collections.defaultdict(list),
+            'insert': collections.defaultdict(list),
+            'full': collections.defaultdict(list),
+        }
+        stage_diagnostics = {
+            'frame_grasp_contact': collections.defaultdict(list),
+            'frame_lift': collections.defaultdict(list),
+            'max_frame_lift_delta': collections.defaultdict(list),
+            'max_grasp_hold_steps': collections.defaultdict(list),
+        }
         log_data = dict()
+        unavailable_stage_flags = [
+            i for i, flags in enumerate(all_stage_flags)
+            if flags is None or not bool(flags.get('available', False))
+        ]
+        if unavailable_stage_flags:
+            raise RuntimeError(
+                "ToolHang simulator-state metrics are unavailable for "
+                f"{len(unavailable_stage_flags)}/{n_inits} rollouts. "
+                "Check robosuite ToolHang compatibility and ensure the "
+                "ToolHang wrapper / runner files were synced together."
+            )
         # results reported in the paper are generated using the commented out line below
         # which will only report and average metrics from first n_envs initial condition and seeds
         # fortunately this won't invalidate our conclusion since
@@ -328,9 +447,32 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
         for i in range(n_inits):
             seed = self.env_seeds[i]
             prefix = self.env_prefixs[i]
-            max_reward = np.max(all_rewards[i])
+            reward_history = np.asarray(all_rewards[i], dtype=np.float32)
+            max_reward = float(np.max(reward_history))
+            final_reward = float(reward_history[-1])
+            stable_window = reward_history[-10:]
+            stable_reward = float(np.all(stable_window >= 1.0))
             max_rewards[prefix].append(max_reward)
+            final_rewards[prefix].append(final_reward)
+            stable_rewards[prefix].append(stable_reward)
             log_data[prefix+f'sim_max_reward_{seed}'] = max_reward
+            log_data[prefix+f'sim_final_reward_{seed}'] = final_reward
+            log_data[prefix+f'sim_stable_reward_{seed}'] = stable_reward
+
+            flags = all_stage_flags[i]
+            if flags is not None and bool(flags.get('available', False)):
+                for stage_name in stage_results:
+                    succeeded = float(bool(flags.get(stage_name, False)))
+                    stage_results[stage_name][prefix].append(succeeded)
+                    log_data[
+                        prefix+f'stage_{stage_name}_success_{seed}'
+                    ] = succeeded
+                for diagnostic_name in stage_diagnostics:
+                    value = float(flags.get(diagnostic_name, 0.0))
+                    stage_diagnostics[diagnostic_name][prefix].append(value)
+                    log_data[
+                        prefix+f'{diagnostic_name}_{seed}'
+                    ] = value
 
             # visualize sim
             video_path = all_video_paths[i]
@@ -341,8 +483,27 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
         # log aggregate metrics
         for prefix, value in max_rewards.items():
             name = prefix+'mean_score'
-            value = np.mean(value)
+            value = float(np.mean(value))
             log_data[name] = value
+        for prefix, value in final_rewards.items():
+            name = prefix+'mean_final_score'
+            value = float(np.mean(value))
+            log_data[name] = value
+        for prefix, value in stable_rewards.items():
+            name = prefix+'mean_stable_score'
+            value = float(np.mean(value))
+            log_data[name] = value
+        for stage_name, prefix_values in stage_results.items():
+            for prefix, value in prefix_values.items():
+                log_data[prefix+f'stage_{stage_name}_rate'] = float(
+                    np.mean(value))
+        for diagnostic_name, prefix_values in stage_diagnostics.items():
+            for prefix, value in prefix_values.items():
+                if diagnostic_name in ('frame_grasp_contact', 'frame_lift'):
+                    metric_name = prefix+f'{diagnostic_name}_rate'
+                else:
+                    metric_name = prefix+f'mean_{diagnostic_name}'
+                log_data[metric_name] = float(np.mean(value))
 
         return log_data
 

@@ -86,6 +86,7 @@ class SampImagePolicy(BaseImagePolicy):
         freq_split_low: int = 0,
         freq_split_high: int = 8,
         sigma_high: float = 0.2,
+        action_group_spectral_params=None,
         # ---- policy flags ----
         pred_action_steps_only: bool = False,
         oa_step_convention: bool = True,
@@ -132,6 +133,7 @@ class SampImagePolicy(BaseImagePolicy):
             freq_split_low=freq_split_low,
             freq_split_high=freq_split_high,
             sigma_high=sigma_high,
+            action_group_spectral_params=action_group_spectral_params,
             norm_layer=partial(nn.LayerNorm, eps=1e-6),
         )
 

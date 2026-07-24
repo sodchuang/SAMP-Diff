@@ -27,9 +27,58 @@ from diffusion_policy.env_runner.base_lowdim_runner import BaseLowdimRunner
 from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
 from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
-from diffusers.training_utils import EMAModel
+from diffusion_policy.model.diffusion.ema_model import EMAModel
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
+
+
+def _apply_gripper_close_semantics(policy, threshold, close_is_greater):
+    """Keep dataset event detection, training loss and rollout latch aligned."""
+    threshold = float(threshold)
+    close_is_greater = bool(close_is_greater)
+    timing_cfg = getattr(policy, 'action_group_timing_params', None)
+    if timing_cfg and timing_cfg.get('gripper', None):
+        timing_cfg['gripper']['close_threshold'] = threshold
+        timing_cfg['gripper']['close_is_greater'] = close_is_greater
+    phase_cfg = getattr(policy.samp_net, 'action_phase_loss_params', None)
+    if phase_cfg:
+        phase_cfg['close_threshold'] = threshold
+        phase_cfg['close_is_greater'] = close_is_greater
+    print(
+        "[Dataset] applied gripper close semantics to policy: "
+        f"threshold={threshold:.6g}, close_is_greater={close_is_greater}"
+    )
+
+
+def _set_samp_encoder_trainable(policy, trainable):
+    """Freeze the observation / trajectory encoder during early transfer."""
+    prefixes = (
+        'samp_net.condition_proj.',
+        'samp_net.embedding_index.',
+        'samp_net.z_proj.',
+        'samp_net.z_proj_ln.',
+        'samp_net.encoder_blocks.',
+        'samp_net.encoder_norm.',
+        'samp_net.encoder_pos_embed_learned',
+    )
+    changed = False
+    for name, parameter in policy.named_parameters():
+        if name.startswith(prefixes) and parameter.requires_grad != trainable:
+            parameter.requires_grad_(trainable)
+            changed = True
+    return changed
+
+
+def _is_mujoco_instability_error(exc):
+    message = str(exc).lower()
+    return (
+        "mujoco" in message
+        and (
+            "simulation is unstable" in message
+            or "huge value in qacc" in message
+            or "nan, inf or huge value" in message
+        )
+    )
 
 
 class TrainSampLowdimWorkspace(BaseWorkspace):
@@ -64,7 +113,26 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
         cfg = copy.deepcopy(self.cfg)
 
         # resume training
-        if cfg.training.resume:
+        resume_from_path = cfg.training.get('resume_from_path', None)
+        cross_stage_transfer = bool(resume_from_path) and not bool(cfg.training.resume)
+        if resume_from_path:
+            resume_from_path = pathlib.Path(os.path.expanduser(str(resume_from_path)))
+            if not resume_from_path.is_file():
+                raise FileNotFoundError(f"resume_from_path not found: {resume_from_path}")
+            print(f"Resuming from checkpoint {resume_from_path}")
+            if cfg.training.resume:
+                # Same-run resume: restore the complete training state.
+                self.load_checkpoint(path=resume_from_path)
+            else:
+                # Cross-stage transfer: keep this stage's output directory and
+                # optimizer, while inheriting model weights and epoch. Loading
+                # _output_dir/global_step would break the new stage's save/LR state.
+                self.load_checkpoint(
+                    path=resume_from_path,
+                    exclude_keys=('optimizer',),
+                    include_keys=('epoch',),
+                )
+        elif cfg.training.resume:
             lastest_ckpt_path = self.get_checkpoint_path()
             if lastest_ckpt_path.is_file():
                 print(f"Resuming from checkpoint {lastest_ckpt_path}")
@@ -74,6 +142,18 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
         dataset: BaseLowdimDataset
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseLowdimDataset)
+        if hasattr(dataset, 'gripper_close_threshold'):
+            _apply_gripper_close_semantics(
+                self.model,
+                dataset.gripper_close_threshold,
+                dataset.gripper_close_is_greater,
+            )
+            if self.ema_model is not None:
+                _apply_gripper_close_semantics(
+                    self.ema_model,
+                    dataset.gripper_close_threshold,
+                    dataset.gripper_close_is_greater,
+                )
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
         normalizer = dataset.get_normalizer()
 
@@ -101,12 +181,15 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
         if cfg.training.use_ema:
             ema = hydra.utils.instantiate(cfg.ema, model=self.ema_model)
 
-        # configure env runner
-        env_runner: BaseLowdimRunner
-        env_runner = hydra.utils.instantiate(
-            cfg.task.env_runner, output_dir=self.output_dir
-        )
-        assert isinstance(env_runner, BaseLowdimRunner)
+        # configure env runner only when rollout is enabled. This allows
+        # dataset-only training on systems without mujoco_py / robosuite.
+        env_runner: BaseLowdimRunner = None
+        rollout_enabled = cfg.training.rollout_every is not None
+        if rollout_enabled:
+            env_runner = hydra.utils.instantiate(
+                cfg.task.env_runner, output_dir=self.output_dir
+            )
+            assert isinstance(env_runner, BaseLowdimRunner)
 
         # configure logging
         wandb_run = wandb.init(
@@ -159,7 +242,65 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
         with JsonLogger(log_path) as json_logger:
-            for local_epoch_idx in range(cfg.training.num_epochs):
+            if (
+                cross_stage_transfer
+                and rollout_enabled
+                and bool(cfg.training.get('rollout_before_training', False))
+            ):
+                policy = self.ema_model if cfg.training.use_ema else self.model
+                policy.eval()
+                policy.reset()
+                print(
+                    f"[Transfer] running pre-training rollout at epoch={self.epoch}"
+                )
+                baseline_log = {
+                    'epoch': self.epoch,
+                    'global_step': self.global_step,
+                    'transfer/pretrain_rollout': True,
+                }
+                try:
+                    baseline_log.update(env_runner.run(policy))
+                except Exception as exc:
+                    if (
+                        not _is_mujoco_instability_error(exc)
+                        or not hasattr(env_runner, "recover_after_worker_error")
+                    ):
+                        raise
+                    print(
+                        "[WARN] Skipping the pre-training transfer rollout "
+                        f"because MuJoCo became unstable: {exc}"
+                    )
+                    env_runner.recover_after_worker_error()
+                    baseline_log[
+                        "rollout/mujoco_instability_skipped"
+                    ] = 1.0
+                finally:
+                    # runner may move policy to CPU before an exception.
+                    policy.to(device)
+                wandb_run.log(baseline_log, step=self.global_step)
+                json_logger.log(baseline_log)
+
+            if self.epoch >= cfg.training.num_epochs:
+                print(
+                    f"Checkpoint epoch {self.epoch} already reached "
+                    f"target num_epochs={cfg.training.num_epochs}; nothing to train."
+                )
+
+            while self.epoch < cfg.training.num_epochs:
+                freeze_until = cfg.training.get(
+                    'freeze_encoder_until_epoch', None)
+                encoder_trainable = (
+                    freeze_until is None or self.epoch >= int(freeze_until)
+                )
+                changed = _set_samp_encoder_trainable(
+                    self.model, encoder_trainable)
+                if changed:
+                    state = 'unfrozen' if encoder_trainable else 'frozen'
+                    print(
+                        f"[Transfer] SAMP encoder {state} at epoch={self.epoch} "
+                        f"(freeze_until={freeze_until})"
+                    )
+                self.model.train()
                 step_log = dict()
 
                 # ========= train for this epoch ==========
@@ -218,12 +359,31 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
                     policy = self.ema_model
                 policy.eval()
 
-                # run rollout（跳過 epoch 0，避免訓練前就做 CPU rollout）
-                if self.epoch > 0 and self.epoch % cfg.training.rollout_every == 0:
-                    runner_log = env_runner.run(policy)
-                    step_log.update(runner_log)
-                    # runner moves policy to CPU; restore to training device
-                    policy.to(device)
+                # run rollout after the configured warmup epoch
+                rollout_start_epoch = cfg.training.get('rollout_start_epoch', 0)
+                if (
+                    rollout_enabled
+                    and self.epoch >= rollout_start_epoch
+                    and self.epoch % cfg.training.rollout_every == 0
+                ):
+                    try:
+                        runner_log = env_runner.run(policy)
+                        step_log.update(runner_log)
+                    except Exception as exc:
+                        if (
+                            not _is_mujoco_instability_error(exc)
+                            or not hasattr(env_runner, "recover_after_worker_error")
+                        ):
+                            raise
+                        print(
+                            "[WARN] Skipping this rollout because MuJoCo became "
+                            f"unstable: {exc}"
+                        )
+                        env_runner.recover_after_worker_error()
+                        step_log["rollout/mujoco_instability_skipped"] = 1.0
+                    finally:
+                        # runner may move policy to CPU before an exception.
+                        policy.to(device)
 
                 # run validation
                 if self.epoch % cfg.training.val_every == 0:
@@ -270,13 +430,18 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
 
                 # checkpoint
                 if self.epoch % cfg.training.checkpoint_every == 0:
-                    print("[DEBUG] step_log keys:", list(step_log.keys()))
                     mean_test_score = step_log.get("test/mean_score", 0.0)
                     mean_train_score = step_log.get("train/mean_score", 0.0)
+                    stage_grasp_rate = step_log.get("test/stage_grasp_rate", 0.0)
+                    stage_insert_rate = step_log.get("test/stage_insert_rate", 0.0)
+                    stage_full_rate = step_log.get("test/stage_full_rate", 0.0)
                     self.save_checkpoint(
                         f"{self.output_dir}/checkpoints/"
                         f"epoch={self.epoch}_test_score={mean_test_score:.3f}"
-                        f"_train_score={mean_train_score:.3f}.ckpt"
+                        f"_train_score={mean_train_score:.3f}"
+                        f"_grasp={stage_grasp_rate:.3f}"
+                        f"_insert={stage_insert_rate:.3f}"
+                        f"_full={stage_full_rate:.3f}.ckpt"
                     )
                     if cfg.checkpoint.save_last_ckpt:
                         self.save_checkpoint()

@@ -1,0 +1,39 @@
+defaults:
+  - square_ph
+  - _self_
+
+# Keep all action dimensions in the unified DCT representation. Translation
+# and gripper retain the original prior; only rotation receives a specialized
+# lower-noise prior, as supported by the Square ablation.
+n_action_steps: 4
+
+dataloader:
+  num_workers: 4
+  persistent_workers: true
+
+val_dataloader:
+  num_workers: 4
+  persistent_workers: true
+
+training:
+  resume: false
+  num_epochs: 6000
+  rollout_every: 50
+
+policy:
+  action_group_spectral_params:
+    translation:
+      indices: [0, 1, 2]
+      freq_split_high: 8
+      sigma: 0.3
+      sigma_high: 0.2
+    rotation:
+      indices: [3, 4, 5, 6, 7, 8]
+      freq_split_high: 16
+      sigma: 0.15
+      sigma_high: 0.15
+    gripper:
+      indices: [9]
+      freq_split_high: 8
+      sigma: 0.3
+      sigma_high: 0.2

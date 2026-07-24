@@ -116,6 +116,9 @@ class SampNet(nn.Module):
         freq_split_low: int = 0,
         freq_split_high: int = 4,
         sigma_high: float = -1.0,   # noise for out-of-band; <0 → pure N(0,I)
+        action_group_spectral_params=None,
+        action_group_loss_weights=None,
+        action_phase_loss_params=None,
         patch_size: int = 1,
         **kwargs,
     ):
@@ -139,6 +142,9 @@ class SampNet(nn.Module):
         self.freq_split_low  = max(0, freq_split_low)
         self.freq_split_high = max(self.freq_split_low, freq_split_high)
         self.sigma_high = sigma_high   # <0 means pure random (original v2 behaviour)
+        self.action_group_spectral_params = action_group_spectral_params
+        self.action_group_loss_weights = action_group_loss_weights
+        self.action_phase_loss_params = action_phase_loss_params
 
         # ---- progressive masking schedule (kept from Freqpolicy) ----
         core_2 = 5
@@ -326,6 +332,318 @@ class SampNet(nn.Module):
         out = torch_dct.idct(c_t, norm='ortho').to(coeffs.dtype)
         return out.transpose(1, 2)
 
+    def _build_action_phase_loss_weight(self, actions_gt: torch.Tensor):
+        cfg = self.action_phase_loss_params
+        if not cfg or not bool(cfg.get('enabled', False)):
+            return None
+
+        action_dim = actions_gt.shape[-1]
+        gripper_indices = [
+            int(index) for index in cfg.get('gripper_indices', [action_dim - 1])
+        ]
+        invalid = [
+            index for index in gripper_indices
+            if index < 0 or index >= action_dim
+        ]
+        if invalid:
+            raise ValueError(
+                f"action_phase_loss gripper_indices invalid: {invalid}"
+            )
+
+        close_threshold = float(cfg.get('close_threshold', 0.0))
+        close_is_greater = bool(cfg.get('close_is_greater', True))
+        transition_radius = max(0, int(cfg.get('transition_radius', 2)))
+        device = actions_gt.device
+
+        gripper = actions_gt.index_select(
+            -1,
+            torch.as_tensor(gripper_indices, device=device),
+        ).mean(dim=-1)
+        if close_is_greater:
+            close = gripper >= close_threshold
+        else:
+            close = gripper <= close_threshold
+
+        prev_close = close.clone()
+        prev_close[:, 1:] = close[:, :-1]
+
+        def expand_transition(transition, radius):
+            radius = max(0, int(radius))
+            if radius <= 0:
+                return transition
+            expanded = transition.clone()
+            for offset in range(1, radius + 1):
+                expanded[:, offset:] = expanded[:, offset:] | transition[:, :-offset]
+                expanded[:, :-offset] = expanded[:, :-offset] | transition[:, offset:]
+            return expanded
+
+        close_transition = close & (~prev_close)
+        close_transition = expand_transition(close_transition, transition_radius)
+
+        release_enabled = bool(cfg.get('release_enabled', False))
+        release_transition = None
+        if release_enabled:
+            release_radius = max(
+                0,
+                int(cfg.get('release_transition_radius', transition_radius)),
+            )
+            release_transition = (~close) & prev_close
+            release_transition = expand_transition(release_transition, release_radius)
+
+        weight = torch.zeros_like(actions_gt)
+
+        def add_group(transition, indices, group_weight):
+            if transition is None or not transition.any():
+                return
+            indices = [int(index) for index in indices]
+            invalid_group = [
+                index for index in indices
+                if index < 0 or index >= action_dim
+            ]
+            if invalid_group:
+                raise ValueError(
+                    f"action_phase_loss group indices invalid: {invalid_group}"
+                )
+            if not indices or float(group_weight) <= 0:
+                return
+            index_tensor = torch.as_tensor(indices, device=device)
+            group_mask = transition.to(dtype=actions_gt.dtype).unsqueeze(-1)
+            update = group_mask.expand(-1, -1, len(indices)) * float(group_weight)
+            current = weight.index_select(-1, index_tensor)
+            weight.index_copy_(
+                -1,
+                index_tensor,
+                current + update,
+            )
+
+        if close_transition.any():
+            add_group(
+                close_transition,
+                cfg.get('translation_indices', [0, 1, 2]),
+                cfg.get('translation_weight', 1.0),
+            )
+            add_group(
+                close_transition,
+                cfg.get('rotation_indices', [3, 4, 5, 6, 7, 8]),
+                cfg.get('rotation_weight', 1.0),
+            )
+            add_group(close_transition, gripper_indices, cfg.get('gripper_weight', 1.0))
+
+        if release_enabled and release_transition is not None and release_transition.any():
+            add_group(
+                release_transition,
+                cfg.get(
+                    'release_translation_indices',
+                    cfg.get('translation_indices', [0, 1, 2]),
+                ),
+                cfg.get(
+                    'release_translation_weight',
+                    cfg.get('translation_weight', 1.0),
+                ),
+            )
+            add_group(
+                release_transition,
+                cfg.get(
+                    'release_rotation_indices',
+                    cfg.get('rotation_indices', [3, 4, 5, 6, 7, 8]),
+                ),
+                cfg.get(
+                    'release_rotation_weight',
+                    cfg.get('rotation_weight', 1.0),
+                ),
+            )
+            add_group(
+                release_transition,
+                gripper_indices,
+                cfg.get('release_gripper_weight', cfg.get('gripper_weight', 1.0)),
+            )
+
+        extra_windows = cfg.get('extra_windows', None)
+        if extra_windows:
+            if hasattr(extra_windows, 'values'):
+                window_iter = extra_windows.values()
+            else:
+                window_iter = extra_windows
+            horizon = actions_gt.shape[1]
+
+            def select_occurrence(events, occurrence):
+                if occurrence is None:
+                    return events
+                if isinstance(occurrence, str):
+                    occurrence = occurrence.lower()
+                    if occurrence in ('all', 'any'):
+                        return events
+                    if occurrence == 'first':
+                        occurrence = 1
+                    elif occurrence == 'second':
+                        occurrence = 2
+                    elif occurrence == 'third':
+                        occurrence = 3
+                    elif occurrence == 'last':
+                        counts = events.to(torch.int64).cumsum(dim=1)
+                        totals = events.to(torch.int64).sum(dim=1, keepdim=True)
+                        return events & (counts == totals) & (totals > 0)
+                    else:
+                        occurrence = int(occurrence)
+                occurrence = int(occurrence)
+                if occurrence <= 0:
+                    raise ValueError(
+                        f"action_phase_loss occurrence must be positive, got {occurrence}"
+                    )
+                counts = events.to(torch.int64).cumsum(dim=1)
+                return events & (counts == occurrence)
+
+            for window_cfg in window_iter:
+                if not window_cfg or not bool(window_cfg.get('enabled', True)):
+                    continue
+                # Prefer event-anchored windows for multi-stage tasks. A fixed
+                # fraction of a randomly sampled training chunk is not a task
+                # phase and can otherwise teach the hang motion before grasp.
+                anchor = str(window_cfg.get('anchor', 'fixed')).lower()
+                if anchor in ('close', 'gripper_close'):
+                    anchor_event = close & (~prev_close)
+                elif anchor in ('release', 'gripper_release'):
+                    anchor_event = (~close) & prev_close
+                elif anchor in ('closed', 'gripper_closed', 'hold'):
+                    anchor_event = close
+                elif anchor == 'fixed':
+                    anchor_event = None
+                else:
+                    raise ValueError(
+                        f"action_phase_loss window anchor invalid: {anchor!r}"
+                    )
+
+                if anchor_event is not None:
+                    anchor_event = select_occurrence(
+                        anchor_event,
+                        window_cfg.get('occurrence', None),
+                    )
+                    before = max(0, int(window_cfg.get('before', 0)))
+                    after = max(0, int(window_cfg.get('after', 0)))
+                    window = anchor_event.clone()
+                    for offset in range(1, before + 1):
+                        window[:, :-offset] |= anchor_event[:, offset:]
+                    for offset in range(1, after + 1):
+                        window[:, offset:] |= anchor_event[:, :-offset]
+                    # When the sampled chunk contains no matching event, this
+                    # layer deliberately contributes no auxiliary loss.
+                    if not window.any():
+                        continue
+                else:
+                    start = window_cfg.get('start', window_cfg.get('start_frac', 0.0))
+                    end = window_cfg.get('end', window_cfg.get('end_frac', 1.0))
+                    if isinstance(start, float) and 0.0 <= start <= 1.0:
+                        start_idx = int(round(start * horizon))
+                    else:
+                        start_idx = int(start)
+                    if isinstance(end, float) and 0.0 <= end <= 1.0:
+                        end_idx = int(round(end * horizon))
+                    else:
+                        end_idx = int(end)
+                    start_idx = max(0, min(horizon, start_idx))
+                    end_idx = max(start_idx, min(horizon, end_idx))
+                    if end_idx <= start_idx:
+                        continue
+                    window = torch.zeros(
+                        actions_gt.shape[:2],
+                        dtype=torch.bool,
+                        device=device,
+                    )
+                    window[:, start_idx:end_idx] = True
+                add_group(
+                    window,
+                    window_cfg.get(
+                        'translation_indices',
+                        cfg.get('translation_indices', [0, 1, 2]),
+                    ),
+                    window_cfg.get('translation_weight', 0.0),
+                )
+                add_group(
+                    window,
+                    window_cfg.get(
+                        'rotation_indices',
+                        cfg.get('rotation_indices', [3, 4, 5, 6, 7, 8]),
+                    ),
+                    window_cfg.get('rotation_weight', 0.0),
+                )
+                add_group(
+                    window,
+                    window_cfg.get('gripper_indices', gripper_indices),
+                    window_cfg.get('gripper_weight', 0.0),
+                )
+
+        if not (weight > 0).any():
+            return None
+
+        return weight
+
+    def _frequency_prior(
+        self,
+        coeffs: torch.Tensor,
+        freq_split_low: int,
+        freq_split_high: int,
+        sigma: float,
+        sigma_high: float,
+    ) -> torch.Tensor:
+        """Apply one frequency-band warm-start schedule."""
+        horizon = coeffs.shape[1]
+        fl = min(max(0, int(freq_split_low)), horizon)
+        fh = min(max(fl, int(freq_split_high)), horizon)
+        mid = coeffs[:, fl:fh] + sigma * torch.randn_like(coeffs[:, fl:fh])
+        if sigma_high < 0:
+            pre = torch.randn_like(coeffs[:, :fl])
+            post = torch.randn_like(coeffs[:, fh:])
+        else:
+            pre = coeffs[:, :fl] + sigma_high * torch.randn_like(coeffs[:, :fl])
+            post = coeffs[:, fh:] + sigma_high * torch.randn_like(coeffs[:, fh:])
+        return torch.cat([pre, mid, post], dim=1)
+
+    def spectral_prior(self, prev_actions: torch.Tensor) -> torch.Tensor:
+        """Build a full-DCT prior with optional action-group parameters."""
+        coeffs = self.full_dct(prev_actions)
+        groups = self.action_group_spectral_params
+        if not groups:
+            return self._frequency_prior(
+                coeffs,
+                self.freq_split_low,
+                self.freq_split_high,
+                self.sigma,
+                self.sigma_high,
+            )
+
+        prior = torch.empty_like(coeffs)
+        assigned = set()
+        for name, raw_cfg in groups.items():
+            cfg = dict(raw_cfg)
+            indices = [int(i) for i in cfg["indices"]]
+            bad = [i for i in indices if i < 0 or i >= self.trajectory_dim]
+            if bad:
+                raise ValueError(f"group {name!r} has invalid action indices: {bad}")
+            overlap = assigned.intersection(indices)
+            if overlap:
+                raise ValueError(
+                    f"group {name!r} overlaps action indices: {sorted(overlap)}"
+                )
+            assigned.update(indices)
+            prior[:, :, indices] = self._frequency_prior(
+                coeffs[:, :, indices],
+                cfg.get("freq_split_low", self.freq_split_low),
+                cfg.get("freq_split_high", self.freq_split_high),
+                cfg.get("sigma", self.sigma),
+                cfg.get("sigma_high", self.sigma_high),
+            )
+
+        remaining = sorted(set(range(self.trajectory_dim)).difference(assigned))
+        if remaining:
+            prior[:, :, remaining] = self._frequency_prior(
+                coeffs[:, :, remaining],
+                self.freq_split_low,
+                self.freq_split_high,
+                self.sigma,
+                self.sigma_high,
+            )
+        return prior
+
     # ------------------------------------------------------------------
     # MAE encoder / decoder (unchanged API from Freqpolicy)
     # ------------------------------------------------------------------
@@ -498,6 +816,7 @@ class SampNet(nn.Module):
         prev_actions: torch.Tensor,
         global_cond: torch.Tensor,
         cold_start_prob: float = 0.2,
+        fresh_action_indices=None,
     ) -> torch.Tensor:
         """Compute flow-matching loss.
 
@@ -518,20 +837,13 @@ class SampNet(nn.Module):
         # x_1 — target in full DCT space
         x_1 = self.full_dct(actions_gt)
 
-        # x_0 — v2 frequency-band prior:
-        #   band [fl : fh]  : DCT(prev) + sigma * noise       (warm memory)
-        #   out-of-band     : DCT(prev) + sigma_high * noise  (soft memory)
-        #                     sigma_high < 0 → pure N(0,I)   (hard reset, original v2)
-        x_0_dct = self.full_dct(prev_actions)          # (B, H, Da)
-        fl, fh  = self.freq_split_low, self.freq_split_high
-        mid  = x_0_dct[:, fl:fh, :] + self.sigma * torch.randn_like(x_0_dct[:, fl:fh, :])
-        if self.sigma_high < 0:
-            pre  = torch.randn_like(x_0_dct[:, :fl, :])
-            post = torch.randn_like(x_0_dct[:, fh:, :])
-        else:
-            pre  = x_0_dct[:, :fl, :] + self.sigma_high * torch.randn_like(x_0_dct[:, :fl, :])
-            post = x_0_dct[:, fh:, :] + self.sigma_high * torch.randn_like(x_0_dct[:, fh:, :])
-        x_0_warm = torch.cat([pre, mid, post], dim=1)  # (B, H, Da)
+        # Every action dimension stays in DCT space. Only the prior schedule
+        # differs by action group when action_group_spectral_params is set.
+        x_0_warm = self.spectral_prior(prev_actions)
+        if fresh_action_indices:
+            x_0_warm[:, :, fresh_action_indices] = torch.randn_like(
+                x_0_warm[:, :, fresh_action_indices]
+            )
         x_0_cold = torch.randn_like(x_1)
         cold_mask = (torch.rand(B, device=x_1.device) < cold_start_prob).view(B, 1, 1)
         x_0 = torch.where(cold_mask, x_0_cold, x_0_warm)
@@ -545,10 +857,21 @@ class SampNet(nn.Module):
         def _vel_fn(x_t, t, **kw):
             return self.velocity_fn(x_t, t, global_cond=global_cond, mask=mask)
 
+        aux_loss_weight = self._build_action_phase_loss_weight(actions_gt)
+        aux_loss_scale = 0.0
+        if aux_loss_weight is not None:
+            aux_loss_scale = float(
+                self.action_phase_loss_params.get('weight', 0.0)
+            )
+
         loss, _ = flow_matcher.compute_loss(
             model=_vel_fn,
             target=x_1,
             start=x_0,
+            loss_groups=self.action_group_loss_weights,
+            aux_loss_weight=aux_loss_weight,
+            aux_loss_transform=self.full_idct,
+            aux_loss_scale=aux_loss_scale,
         )
         return loss
 
@@ -563,6 +886,7 @@ class SampNet(nn.Module):
         prev_actions,
         global_cond: torch.Tensor,
         num_steps: int = 6,
+        fresh_action_indices=None,
     ) -> torch.Tensor:
         """Generate action trajectory via Euler ODE in DCT space.
 
@@ -581,16 +905,11 @@ class SampNet(nn.Module):
         if prev_actions is None:
             x_0 = torch.randn(B, H, Da, device=device)
         else:
-            x_0_dct = self.full_dct(prev_actions)
-            fl, fh  = self.freq_split_low, self.freq_split_high
-            mid  = x_0_dct[:, fl:fh, :] + self.sigma * torch.randn_like(x_0_dct[:, fl:fh, :])
-            if self.sigma_high < 0:
-                pre  = torch.randn_like(x_0_dct[:, :fl, :])
-                post = torch.randn_like(x_0_dct[:, fh:, :])
-            else:
-                pre  = x_0_dct[:, :fl, :] + self.sigma_high * torch.randn_like(x_0_dct[:, :fl, :])
-                post = x_0_dct[:, fh:, :] + self.sigma_high * torch.randn_like(x_0_dct[:, fh:, :])
-            x_0 = torch.cat([pre, mid, post], dim=1)
+            x_0 = self.spectral_prior(prev_actions)
+            if fresh_action_indices:
+                x_0[:, :, fresh_action_indices] = torch.randn_like(
+                    x_0[:, :, fresh_action_indices]
+                )
 
         def _vel_fn(x_t, t, **kw):
             return self.velocity_fn(x_t, t, global_cond=global_cond)

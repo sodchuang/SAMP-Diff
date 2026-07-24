@@ -1,7 +1,5 @@
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
 *.so
 
 .env
@@ -11,15 +9,20 @@ ENTER/
 miniforge3/
 conda/
 
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.idea/
+.vscode/
+
 data/
-SAMP_Diff_v1/data/
 outputs/
-SAMP_Diff_v1/outputs/
 results/
-SAMP_Diff_v1/results/
-SAMP_Diff_v1/results_step4/
-SAMP_Diff_v1/results_step_ablation/
 wandb/
+media/
+checkpoints/
+analysis_sheets/
+tmp_toolhang_sheets/
 
 *.ckpt
 *.pt
@@ -28,5 +31,8 @@ wandb/
 *.zarr
 *.hdf5
 *.h5
-
 *.log
+*.mp4
+
+.DS_Store
+Thumbs.db

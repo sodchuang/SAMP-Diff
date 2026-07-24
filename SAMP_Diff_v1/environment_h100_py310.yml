@@ -1,0 +1,11 @@
+name: robodiff310
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip=24.0
+  - setuptools=65.5.0
+  - wheel
+  # Keep this file intentionally minimal. The previous all-in-one env solved
+  # through pyarrow / pyqt / qt-main and often failed on disposable H100 nodes.
+  # Install runtime packages with pip after torch is fixed.

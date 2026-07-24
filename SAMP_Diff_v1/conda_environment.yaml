@@ -1,16 +1,20 @@
-name: robodiff
+name: robodiff310
 channels:
-  - pytorch
-  - pytorch3d
-  - nvidia
   - conda-forge
 dependencies:
-  - python=3.9
+  - python=3.10
   - pip=22.2.2
-  - cudatoolkit=11.6
-  - pytorch=1.12.1
-  - torchvision=0.13.1
-  - pytorch3d=0.7.0
+  - setuptools=65.5.0
+  - wheel
+  # H100 note:
+  # Install torch/torchvision after env creation with an explicit CUDA wheel.
+  # Keeping torch out of this file avoids accidental cu130 installs from pip
+  # dependencies and avoids older CUDA 11.x wheels on H100.
+  # Recommended after activation:
+  # pip install torch==2.3.1+cu121 torchvision==0.18.1+cu121 \
+  #   --index-url https://download.pytorch.org/whl/cu121
+  # pytorch3d is not required for low-dim PushT/RoboMimic training.
+  # - pytorch3d=0.7.0
   - numpy=1.23.3
   - numba==0.56.4
   - scipy==1.9.1
@@ -52,14 +56,31 @@ dependencies:
   - imagecodecs==2022.8.8
   - pip:
     - ray[default,tune]==2.2.0
-    # requires mujoco py dependencies libosmesa6-dev libgl1-mesa-glx libglfw3 patchelf
-    - free-mujoco-py==2.1.6
+    # MuJoCo / simulator extras are intentionally disabled for the first
+    # train-only environment. Install them later only when eval is needed.
+    # Install free-mujoco-py only after MUJOCO_PATH is configured.
+    # It can fail during env creation with:
+    # RuntimeError: MUJOCO_PATH environment variable is not set
+    # - free-mujoco-py==2.1.6
     - pygame==2.1.2
-    - pybullet-svl==3.1.6.4
-    - robosuite @ https://github.com/cheng-chi/robosuite/archive/277ab9588ad7a4f4b55cf75508b44aa67ec171f0.tar.gz
+    # pybullet-svl is not needed for PushT / RoboMimic low-dim runs.
+    # It may fail during setup if setuptools/pkg_resources is missing.
+    # - pybullet-svl==3.1.6.4
+    # Install robosuite after env creation with --no-deps. Its legacy
+    # dependency pin asks for numba<=0.53.1, which is incompatible with
+    # Python 3.10 even though this code path works with numba 0.56.4.
+    # - robosuite @ https://github.com/cheng-chi/robosuite/archive/277ab9588ad7a4f4b55cf75508b44aa67ec171f0.tar.gz
     - robomimic==0.2.0
-    - pytorchvideo==0.1.5
+    # pytorchvideo can pull torch during pip resolution; install later if
+    # image/video policy code needs it.
+    # - pytorchvideo==0.1.5
     # pip package required for jpeg-xl
     - imagecodecs==2022.9.26
-    - r3m @ https://github.com/facebookresearch/r3m/archive/b2334e726887fa0206962d7984c69c5fb09cceab.tar.gz
-    - dm-control==1.0.9
+    # r3m is image-policy related and not needed for current low-dim runs.
+    # - r3m @ https://github.com/facebookresearch/r3m/archive/b2334e726887fa0206962d7984c69c5fb09cceab.tar.gz
+    # dm-control may pull MuJoCo dependencies; install later if needed.
+    # - dm-control==1.0.9
+    # Install these after torch with --no-deps, otherwise torchcfm may upgrade
+    # torch to a CUDA build that is newer than the node driver supports.
+    # - torchcfm
+    # - torch-dct

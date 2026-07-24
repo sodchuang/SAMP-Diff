@@ -13,6 +13,56 @@ import torchcfm.conditional_flow_matching as cfm
 from diffusion_policy.utils.flow.base_flow_matcher import BaseFlowMatcher
 
 
+def group_balanced_mse(squared_error: torch.Tensor, groups=None) -> torch.Tensor:
+    """Average within each action group, then average the group losses."""
+    if not groups:
+        return squared_error.mean()
+
+    action_dim = squared_error.shape[-1]
+    assigned = set()
+    weighted_losses = []
+    total_weight = 0.0
+
+    for name, raw_cfg in groups.items():
+        cfg = dict(raw_cfg)
+        indices = [int(index) for index in cfg["indices"]]
+        if not indices:
+            raise ValueError(f"loss group {name!r} has no action indices")
+
+        invalid = [index for index in indices if index < 0 or index >= action_dim]
+        if invalid:
+            raise ValueError(
+                f"loss group {name!r} has invalid action indices: {invalid}"
+            )
+        overlap = assigned.intersection(indices)
+        if overlap:
+            raise ValueError(
+                f"loss group {name!r} overlaps action indices: {sorted(overlap)}"
+            )
+
+        weight = float(cfg.get("weight", 1.0))
+        if weight < 0:
+            raise ValueError(f"loss group {name!r} has negative weight: {weight}")
+        assigned.update(indices)
+        if weight == 0:
+            continue
+
+        index_tensor = torch.as_tensor(indices, device=squared_error.device)
+        group_loss = squared_error.index_select(-1, index_tensor).mean()
+        weighted_losses.append(group_loss * weight)
+        total_weight += weight
+
+    remaining = sorted(set(range(action_dim)).difference(assigned))
+    if remaining:
+        index_tensor = torch.as_tensor(remaining, device=squared_error.device)
+        weighted_losses.append(squared_error.index_select(-1, index_tensor).mean())
+        total_weight += 1.0
+
+    if total_weight <= 0:
+        raise ValueError("at least one loss group must have a positive weight")
+    return torch.stack(weighted_losses).sum() / total_weight
+
+
 class TorchFlowMatcher(BaseFlowMatcher):
     """Generic wrapper around a torchcfm flow-matching object.
 
@@ -31,7 +81,17 @@ class TorchFlowMatcher(BaseFlowMatcher):
         self.fm = fm
         self.num_sampling_steps = num_sampling_steps
 
-    def compute_loss(self, model, target: torch.Tensor, start=None, **kwargs):
+    def compute_loss(
+        self,
+        model,
+        target: torch.Tensor,
+        start=None,
+        loss_groups=None,
+        aux_loss_weight=None,
+        aux_loss_transform=None,
+        aux_loss_scale: float = 1.0,
+        **kwargs,
+    ):
         """Compute flow-matching training loss.
 
         Args:
@@ -48,8 +108,27 @@ class TorchFlowMatcher(BaseFlowMatcher):
         x0 = torch.randn_like(target) if start is None else start
         t, x_t, u_t = self.fm.sample_location_and_conditional_flow(x0, target)
         v_t = model(x_t, t, **kwargs)
-        loss = torch.mean((v_t - u_t) ** 2)
-        return loss, {'loss': loss.item()}
+        error = v_t - u_t
+        loss = group_balanced_mse(error ** 2, loss_groups)
+
+        aux_loss = None
+        if aux_loss_weight is not None:
+            aux_error = error
+            if aux_loss_transform is not None:
+                aux_error = aux_loss_transform(aux_error)
+            aux_weight = aux_loss_weight.to(
+                device=aux_error.device,
+                dtype=aux_error.dtype,
+            )
+            aux_weight_sum = aux_weight.sum()
+            if aux_weight_sum > 0:
+                aux_loss = ((aux_error ** 2) * aux_weight).sum() / aux_weight_sum
+                loss = loss + float(aux_loss_scale) * aux_loss
+
+        info = {'loss': loss.item()}
+        if aux_loss is not None:
+            info['aux_loss'] = aux_loss.item()
+        return loss, info
 
     def sample(
         self,

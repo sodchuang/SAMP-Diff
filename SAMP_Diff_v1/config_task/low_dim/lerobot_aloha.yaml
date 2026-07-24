@@ -23,6 +23,27 @@ obs_as_local_cond: false
 pred_action_steps_only: false
 oa_step_convention: true
 
+task_semantics:
+  domain: lerobot_aloha
+  task_name: aloha_transfer_cube
+  control_mode: joint_position
+  action_representation: dual_arm_joints_grippers
+  action_groups:
+    left_arm_joints: [0, 1, 2, 3, 4, 5]
+    left_gripper: [6]
+    right_arm_joints: [7, 8, 9, 10, 11, 12]
+    right_gripper: [13]
+  routing:
+    spectral: [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]
+    direct: [6, 13]
+  diagnostics:
+    smooth_groups:
+      left_arm_joints: [0, 1, 2, 3, 4, 5]
+      right_arm_joints: [7, 8, 9, 10, 11, 12]
+    contact_groups:
+      left_gripper: [6]
+      right_gripper: [13]
+
 checkpoint:
   save_last_ckpt: true
   save_last_snapshot: false
@@ -129,6 +150,10 @@ policy:
 
   # A2A warm-start
   sigma: 0.05          # ALOHA 動作較平滑，使用較小噪聲
+  cold_start_prob: 0.3
+  freq_split_low: 0
+  freq_split_high: 32
+  sigma_high: 0.05
 
 task:
   repo_id: lerobot/aloha_sim_transfer_cube_human

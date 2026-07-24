@@ -9,6 +9,7 @@
 #   DEVICE=cuda:1 NUM_EPOCHS=4000 N_EPISODES=50 bash scripts/run_experiments.sh
 #   RUN_FILTER=A1 bash scripts/run_experiments.sh
 #   RUN_FILTER=A2 SKIP_TRAIN_IF_CKPT=true bash scripts/run_experiments.sh
+#   START_AFTER_EXP=v2c_split08_sh02_step4 bash scripts/run_experiments.sh
 #
 # RUN_FILTER options:
 #   ALL, A1, A2, A3_SPLIT, A3_SH, A3_SIGMA, A3_COLD
@@ -30,7 +31,16 @@ METRICS_SCRIPT="${METRICS_SCRIPT:-compute_motion_metrics.py}"
 RESULTS_DIR="${RESULTS_DIR:-results/pusht_ablation_all}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-data/outputs/pusht_ablation_all}"
 RUN_FILTER="${RUN_FILTER:-ALL}"
-SKIP_TRAIN_IF_CKPT="${SKIP_TRAIN_IF_CKPT:-false}"
+SKIP_TRAIN_IF_CKPT="${SKIP_TRAIN_IF_CKPT:-true}"
+SKIP_DONE_IF_METRICS="${SKIP_DONE_IF_METRICS:-true}"
+START_AFTER_EXP="${START_AFTER_EXP:-}"
+WANDB_MODE="${WANDB_MODE:-offline}"
+WANDB_SILENT="${WANDB_SILENT:-true}"
+WANDB_ERROR_REPORTING="${WANDB_ERROR_REPORTING:-false}"
+
+export WANDB_MODE
+export WANDB_SILENT
+export WANDB_ERROR_REPORTING
 
 mkdir -p "${RESULTS_DIR}/raw_metrics" "${RESULTS_DIR}/train_logs" "${OUTPUT_ROOT}"
 
@@ -91,6 +101,40 @@ metric_std() {
     ' "$file"
 }
 
+metrics_complete() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+    grep -q "Mean Score" "$file" \
+        && grep -q "Path Length" "$file" \
+        && grep -q "Jerk Cost" "$file" \
+        && grep -q "Discontinuity" "$file"
+}
+
+append_summary_row_from_metrics() {
+    local section="$1"
+    local exp_name="$2"
+    local ckpt="$3"
+    local metrics_out="$4"
+
+    local mean_score mean_score_std path_length path_length_std jerk_cost jerk_cost_std discontinuity discontinuity_std
+    mean_score="$(metric_mean "Mean Score" "${metrics_out}")"
+    mean_score_std="$(metric_std "Mean Score" "${metrics_out}")"
+    path_length="$(metric_mean "Path Length" "${metrics_out}")"
+    path_length_std="$(metric_std "Path Length" "${metrics_out}")"
+    jerk_cost="$(metric_mean "Jerk Cost" "${metrics_out}")"
+    jerk_cost_std="$(metric_std "Jerk Cost" "${metrics_out}")"
+    discontinuity="$(metric_mean "Discontinuity" "${metrics_out}")"
+    discontinuity_std="$(metric_std "Discontinuity" "${metrics_out}")"
+
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "${section}" "${exp_name}" "${ckpt}" \
+        "${mean_score:-NA}" "${mean_score_std:-NA}" \
+        "${path_length:-NA}" "${path_length_std:-NA}" \
+        "${jerk_cost:-NA}" "${jerk_cost_std:-NA}" \
+        "${discontinuity:-NA}" "${discontinuity_std:-NA}" \
+        >> "${SUMMARY_TSV}"
+}
+
 append_experiment_row() {
     local section="$1"
     local exp_name="$2"
@@ -107,6 +151,8 @@ append_experiment_row() {
         "${sigma}" "${sigma_high}" "${cold_start}" "${purpose}" >> "${EXPERIMENTS_TSV}"
 }
 
+REACHED_START=false
+
 run_exp() {
     local section="$1"
     local exp_name="$2"
@@ -121,6 +167,16 @@ run_exp() {
     append_experiment_row \
         "${section}" "${exp_name}" "${steps}" "${split_low}" "${split_high}" \
         "${sigma}" "${sigma_high}" "${cold_start}" "${purpose}"
+
+    if [[ -n "${START_AFTER_EXP}" && "${REACHED_START}" == "false" ]]; then
+        if [[ "${exp_name}" == "${START_AFTER_EXP}" ]]; then
+            REACHED_START=true
+            echo "[START MARK] reached ${START_AFTER_EXP}; continue from next experiment"
+            return
+        fi
+        echo "[SKIP BEFORE START] ${exp_name}"
+        return
+    fi
 
     if ! should_run_section "${section}"; then
         return
@@ -146,6 +202,12 @@ run_exp() {
     local ckpt=""
     ckpt="$(latest_checkpoint "${exp_dir}" || true)"
 
+    if [[ "${SKIP_DONE_IF_METRICS}" == "true" && -n "${ckpt}" ]] && metrics_complete "${metrics_out}"; then
+        echo "[SKIP DONE] ${exp_name}: checkpoint + metrics already exist"
+        append_summary_row_from_metrics "${section}" "${exp_name}" "${ckpt}" "${metrics_out}"
+        return
+    fi
+
     if [[ "${SKIP_TRAIN_IF_CKPT}" == "true" && -n "${ckpt}" ]]; then
         echo "[SKIP TRAIN] Found existing checkpoint: ${ckpt}"
     else
@@ -157,7 +219,7 @@ run_exp() {
             "training.resume=false" \
             "logging.name=${exp_name}" \
             "logging.project=samp_diff_pusht_ablation" \
-            "logging.mode=online" \
+            "logging.mode=${WANDB_MODE}" \
             "policy.num_inference_steps=${steps}" \
             "policy.freq_split_low=${split_low}" \
             "policy.freq_split_high=${split_high}" \
@@ -184,74 +246,54 @@ run_exp() {
         --max_steps 300 \
         2>&1 | tee "${metrics_out}"
 
-    local mean_score mean_score_std path_length path_length_std jerk_cost jerk_cost_std discontinuity discontinuity_std
-    mean_score="$(metric_mean "Mean Score" "${metrics_out}")"
-    mean_score_std="$(metric_std "Mean Score" "${metrics_out}")"
-    path_length="$(metric_mean "Path Length" "${metrics_out}")"
-    path_length_std="$(metric_std "Path Length" "${metrics_out}")"
-    jerk_cost="$(metric_mean "Jerk Cost" "${metrics_out}")"
-    jerk_cost_std="$(metric_std "Jerk Cost" "${metrics_out}")"
-    discontinuity="$(metric_mean "Discontinuity" "${metrics_out}")"
-    discontinuity_std="$(metric_std "Discontinuity" "${metrics_out}")"
-
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-        "${section}" "${exp_name}" "${ckpt}" \
-        "${mean_score:-NA}" "${mean_score_std:-NA}" \
-        "${path_length:-NA}" "${path_length_std:-NA}" \
-        "${jerk_cost:-NA}" "${jerk_cost_std:-NA}" \
-        "${discontinuity:-NA}" "${discontinuity_std:-NA}" \
-        >> "${SUMMARY_TSV}"
+    append_summary_row_from_metrics "${section}" "${exp_name}" "${ckpt}" "${metrics_out}"
 }
 
 # A1. Main 4-step ablation.
-#run_exp A1 freq_full_warm_step4        4 0 16 0.3  0.3 0.3 "Full-frequency warm-start baseline"
-#run_exp A1 freq_split04_random_step4   4 0  4 0.3 -1.0 0.3 "Low 4 frequencies warm, high frequencies random"
-#run_exp A1 freq_split08_random_step4   4 0  8 0.3 -1.0 0.3 "Low 8 frequencies warm, high frequencies random"
-#run_exp A1 v2c_split08_sh02_step4      4 0  8 0.3  0.2 0.3 "Main method: low 8 warm, high-frequency weak anchor"
-#run_exp A1 freq_split04_sh02_step4     4 0  4 0.3  0.2 0.3 "Split-range control with weak high-frequency anchor"
-#run_exp A1 freq_split08_sh05_step4     4 0  8 0.3  0.5 0.3 "High-frequency perturbation too strong control"
+run_exp A1 freq_full_warm_step4        4 0 16 0.3  0.3 0.3 "Full-frequency warm-start baseline"
+run_exp A1 freq_split04_random_step4   4 0  4 0.3 -1.0 0.3 "Low 4 frequencies warm, high frequencies random"
+run_exp A1 freq_split08_random_step4   4 0  8 0.3 -1.0 0.3 "Low 8 frequencies warm, high frequencies random"
+run_exp A1 v2c_split08_sh02_step4      4 0  8 0.3  0.2 0.3 "Main method: low 8 warm, high-frequency weak anchor"
+run_exp A1 freq_split04_sh02_step4     4 0  4 0.3  0.2 0.3 "Split-range control with weak high-frequency anchor"
+run_exp A1 freq_split08_sh05_step4     4 0  8 0.3  0.5 0.3 "High-frequency perturbation too strong control"
 
 # A2. v2c inference-step ablation.
-#run_exp A2 v2c_split08_sh02_step1      1 0  8 0.3  0.2 0.3 "Extreme low-step inference"
-#run_exp A2 v2c_split08_sh02_step2      2 0  8 0.3  0.2 0.3 "Low-step inference comparable to few-step baselines"
-#run_exp A2 v2c_split08_sh02_step4      4 0  8 0.3  0.2 0.3 "Main 4-step setting"
-#run_exp A2 v2c_split08_sh02_step6      6 0  8 0.3  0.2 0.3 "Previous 6-step setting"
-#run_exp A2 v2c_split08_sh02_step8      8 0  8 0.3  0.2 0.3 "More-step inference upper check"
+run_exp A2 v2c_split08_sh02_step1      1 0  8 0.3  0.2 0.3 "Extreme low-step inference"
+run_exp A2 v2c_split08_sh02_step2      2 0  8 0.3  0.2 0.3 "Low-step inference comparable to few-step baselines"
+run_exp A2 v2c_split08_sh02_step4      4 0  8 0.3  0.2 0.3 "Main 4-step setting"
+run_exp A2 v2c_split08_sh02_step6      6 0  8 0.3  0.2 0.3 "Previous 6-step setting"
+run_exp A2 v2c_split08_sh02_step8      8 0  8 0.3  0.2 0.3 "More-step inference upper check"
 
 # A3-1. freq_split_high sweep.
-#run_exp A3_SPLIT coef_split2_step4      4 0  2 0.3  0.2 0.3 "Frequency split high sweep: 2"
-#run_exp A3_SPLIT coef_split4_step4      4 0  4 0.3  0.2 0.3 "Frequency split high sweep: 4"
-#run_exp A3_SPLIT coef_split8_step4      4 0  8 0.3  0.2 0.3 "Frequency split high sweep: 8"
-#run_exp A3_SPLIT coef_split12_step4     4 0 12 0.3  0.2 0.3 "Frequency split high sweep: 12"
-#run_exp A3_SPLIT coef_split16_step4     4 0 16 0.3  0.2 0.3 "Frequency split high sweep: 16"
+run_exp A3_SPLIT coef_split2_step4      4 0  2 0.3  0.2 0.3 "Frequency split high sweep: 2"
+run_exp A3_SPLIT coef_split4_step4      4 0  4 0.3  0.2 0.3 "Frequency split high sweep: 4"
+run_exp A3_SPLIT coef_split8_step4      4 0  8 0.3  0.2 0.3 "Frequency split high sweep: 8"
+run_exp A3_SPLIT coef_split12_step4     4 0 12 0.3  0.2 0.3 "Frequency split high sweep: 12"
+run_exp A3_SPLIT coef_split16_step4     4 0 16 0.3  0.2 0.3 "Frequency split high sweep: 16"
 
 # A3-2. sigma_high sweep.
-#run_exp A3_SH coef_sh_random_step4      4 0  8 0.3 -1.0 0.3 "High frequencies fully random"
-#run_exp A3_SH coef_sh0p0_step4          4 0  8 0.3  0.0 0.3 "High frequencies fully preserved"
-#run_exp A3_SH coef_sh0p1_step4          4 0  8 0.3  0.1 0.3 "Weak high-frequency perturbation"
-#run_exp A3_SH coef_sh0p2_step4          4 0  8 0.3  0.2 0.3 "Main sigma_high setting"
-#run_exp A3_SH coef_sh0p3_step4          4 0  8 0.3  0.3 0.3 "Medium high-frequency perturbation"
-#run_exp A3_SH coef_sh0p5_step4          4 0  8 0.3  0.5 0.3 "Strong high-frequency perturbation"
+run_exp A3_SH coef_sh_random_step4      4 0  8 0.3 -1.0 0.3 "High frequencies fully random"
+run_exp A3_SH coef_sh0p0_step4          4 0  8 0.3  0.0 0.3 "High frequencies fully preserved"
+run_exp A3_SH coef_sh0p1_step4          4 0  8 0.3  0.1 0.3 "Weak high-frequency perturbation"
+run_exp A3_SH coef_sh0p2_step4          4 0  8 0.3  0.2 0.3 "Main sigma_high setting"
+run_exp A3_SH coef_sh0p3_step4          4 0  8 0.3  0.3 0.3 "Medium high-frequency perturbation"
+run_exp A3_SH coef_sh0p5_step4          4 0  8 0.3  0.5 0.3 "Strong high-frequency perturbation"
 
 # A3-3. sigma sweep.
-#run_exp A3_SIGMA coef_sigma0p1_step4    4 0  8 0.1  0.2 0.3 "Warm-start noise sigma sweep: 0.1"
-#run_exp A3_SIGMA coef_sigma0p2_step4    4 0  8 0.2  0.2 0.3 "Warm-start noise sigma sweep: 0.2"
-#run_exp A3_SIGMA coef_sigma0p3_step4    4 0  8 0.3  0.2 0.3 "Main sigma setting"
-#run_exp A3_SIGMA coef_sigma0p5_step4    4 0  8 0.5  0.2 0.3 "Warm-start noise sigma sweep: 0.5"
+run_exp A3_SIGMA coef_sigma0p1_step4    4 0  8 0.1  0.2 0.3 "Warm-start noise sigma sweep: 0.1"
+run_exp A3_SIGMA coef_sigma0p2_step4    4 0  8 0.2  0.2 0.3 "Warm-start noise sigma sweep: 0.2"
+run_exp A3_SIGMA coef_sigma0p3_step4    4 0  8 0.3  0.2 0.3 "Main sigma setting"
+run_exp A3_SIGMA coef_sigma0p5_step4    4 0  8 0.5  0.2 0.3 "Warm-start noise sigma sweep: 0.5"
 
 # A3-4. cold_start_prob sweep.
-#run_exp A3_COLD coef_cold0p0_step4      4 0  8 0.3  0.2 0.0 "Cold-start probability sweep: 0.0"
-#run_exp A3_COLD coef_cold0p1_step4      4 0  8 0.3  0.2 0.1 "Cold-start probability sweep: 0.1"
-#run_exp A3_COLD coef_cold0p3_step4      4 0  8 0.3  0.2 0.3 "Main cold-start probability"
-#run_exp A3_COLD coef_cold0p5_step4      4 0  8 0.3  0.2 0.5 "Cold-start probability sweep: 0.5"
+run_exp A3_COLD coef_cold0p0_step4      4 0  8 0.3  0.2 0.0 "Cold-start probability sweep: 0.0"
+run_exp A3_COLD coef_cold0p1_step4      4 0  8 0.3  0.2 0.1 "Cold-start probability sweep: 0.1"
+run_exp A3_COLD coef_cold0p3_step4      4 0  8 0.3  0.2 0.3 "Main cold-start probability"
+run_exp A3_COLD coef_cold0p5_step4      4 0  8 0.3  0.2 0.5 "Cold-start probability sweep: 0.5"
 
-# A4-1 6steps 
-#run_exp A1_6 freq_full_warm_step6        6 0 16 0.3  0.3 0.3 "6-step full-frequency warm-start baseline"
-run_exp A1_6 freq_split08_random_step6   6 0  8 0.3 -1.0 0.3 "6-step low 8 frequencies warm, high frequencies random"
-run_exp A1_6 freq_split04_sh02_step6     6 0  4 0.3  0.2 0.3 "6-step split04 weak high-frequency anchoring"
-run_exp A1_6 v2c_split08_sh02_step6      6 0  8 0.3  0.2 0.3 "6-step main method: split08 weak high-frequency anchoring"
-run_exp A1_6 coef_sh0p1_step6            6 0  8 0.3  0.1 0.3 "6-step smoother weak high-frequency perturbation"
-run_exp A1_6 freq_split08_sh05_step6     6 0  8 0.3  0.5 0.3 "6-step strong high-frequency perturbation"
+if [[ -n "${START_AFTER_EXP}" && "${REACHED_START}" == "false" ]]; then
+    echo "[WARN] START_AFTER_EXP not found: ${START_AFTER_EXP}"
+fi
 
 echo "================================================================="
 echo "All requested experiments for RUN_FILTER=${RUN_FILTER} are done."

@@ -5,20 +5,21 @@
 #   bash scripts/train_robomimic.sh --list
 #   bash scripts/train_robomimic.sh --check lift_ph
 #   DEVICE=cuda:1 bash scripts/train_robomimic.sh lift_ph
-#   TASKS="lift_ph can_ph square_ph transport_ph" bash scripts/train_robomimic.sh all
+#   NUM_EPOCHS=6000 TASKS="can_ph square_ph transport_ph lift_ph" bash scripts/train_robomimic.sh all
 
 set -euo pipefail
 
-SUPPORTED_TASKS=(lift_ph can_ph square_ph transport_ph)
+SUPPORTED_TASKS=(lift_ph can_ph square_ph tool_hang_ph transport_ph)
 DEVICE="${DEVICE:-cuda:0}"
 DATA_ROOT="${DATA_ROOT:-data/robomimic/datasets}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-data/outputs/robomimic}"
-NUM_EPOCHS="${NUM_EPOCHS:-}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-data/outputs/robomimic_group_spectral}"
+NUM_EPOCHS="${NUM_EPOCHS:-6000}"
 BATCH_SIZE="${BATCH_SIZE:-}"
 NUM_WORKERS="${NUM_WORKERS:-}"
 RESUME="${RESUME:-true}"
 WANDB_MODE="${WANDB_MODE:-offline}"
 TASKS="${TASKS:-}"
+ROLLOUT_EVERY="${ROLLOUT_EVERY:-}"
 
 usage() {
     cat <<'EOF'
@@ -28,11 +29,14 @@ Usage:
   bash scripts/train_robomimic.sh TASK
   bash scripts/train_robomimic.sh all
 
-Supported tasks: lift_ph can_ph square_ph transport_ph
+Supported tasks: lift_ph can_ph square_ph tool_hang_ph transport_ph
 
 Environment overrides:
   DEVICE, DATA_ROOT, OUTPUT_ROOT, NUM_EPOCHS, BATCH_SIZE,
-  NUM_WORKERS, RESUME, WANDB_MODE, TASKS
+  NUM_WORKERS, RESUME, WANDB_MODE, TASKS, ROLLOUT_EVERY
+
+By default this script disables robomimic rollout because rollout requires
+mujoco_py. Set ROLLOUT_EVERY=50 after mujoco_py is installed.
 EOF
 }
 
@@ -70,7 +74,12 @@ check_task() {
         return 1
     }
 
-    python train.py +        --config-name="$task" +        --cfg job +        "task.dataset_path=$dataset" +        "training.device=$DEVICE" +        >/dev/null
+    python train.py \
+        --config-name="$task" \
+        --cfg job \
+        "task.dataset_path=$dataset" \
+        "training.device=$DEVICE" \
+        >/dev/null
 
     echo "[OK] $task"
     echo "     config : $config"
@@ -92,8 +101,9 @@ train_task() {
         "hydra.run.dir=$output_dir"
         "training.device=$DEVICE"
         "training.resume=$RESUME"
+        "training.rollout_every=null"
         "logging.mode=$WANDB_MODE"
-        "logging.name=samp_diff_${task}_v2c_step6"
+        "logging.name=samp_diff_${task}_group_spectral_step6"
         "policy.num_inference_steps=6"
         "policy.sigma=0.3"
         "policy.cold_start_prob=0.3"
@@ -102,6 +112,7 @@ train_task() {
         "policy.sigma_high=0.2"
     )
     [[ -n "$NUM_EPOCHS" ]] && args+=("training.num_epochs=$NUM_EPOCHS")
+    [[ -n "$ROLLOUT_EVERY" ]] && args+=("training.rollout_every=$ROLLOUT_EVERY")
     if [[ -n "$BATCH_SIZE" ]]; then
         args+=("dataloader.batch_size=$BATCH_SIZE")
         args+=("val_dataloader.batch_size=$BATCH_SIZE")
@@ -116,6 +127,8 @@ train_task() {
 }
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
+export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 
 command="${1:---help}"
 case "$command" in

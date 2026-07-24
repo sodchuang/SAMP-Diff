@@ -1,7 +1,7 @@
 _target_: diffusion_policy.workspace.train_samp_lowdim_workspace.TrainSampLowdimWorkspace
 
 action_dim: 10
-obs_dim: 19
+obs_dim: 53
 horizon: 16
 n_obs_steps: 2
 n_action_steps: 8
@@ -13,7 +13,7 @@ oa_step_convention: true
 
 task_semantics:
   domain: robomimic
-  task_name: lift_ph
+  task_name: tool_hang_ph
   control_mode: abs_eef_pose
   action_representation: xyz_rotation6d_gripper
   action_groups:
@@ -75,13 +75,13 @@ logging:
   mode: offline
   project: samp_diff_robomimic_v2c
   entity: null
-  name: samp_diff_lift_ph_v2c_step6
+  name: samp_diff_tool_hang_ph_v2c_step6
   resume: true
-  tags: [samp_lowdim, robomimic, lift, ph, v2c_step6]
+  tags: [samp_lowdim, robomimic, tool_hang, ph, v2c_step6]
 
 multi_run:
-  run_dir: data/outputs/robomimic/lift_ph
-  wandb_name_base: samp_diff_lift_ph_v2c_step6
+  run_dir: data/outputs/robomimic/tool_hang_ph
+  wandb_name_base: samp_diff_tool_hang_ph_v2c_step6
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -95,12 +95,14 @@ training:
   seed: ${data_split.seed}
   debug: false
   resume: true
+  resume_from_path: null
   lr_scheduler: cosine
   lr_warmup_steps: 500
   num_epochs: 6000
   gradient_accumulate_every: 1
   use_ema: true
   rollout_every: 50
+  rollout_start_epoch: 0
   checkpoint_every: 50
   val_every: 1
   sample_every: 5
@@ -150,11 +152,119 @@ policy:
       freq_split_high: 16
       sigma: 0.5
       sigma_high: 0.5
+  action_group_loss_weights:
+    translation:
+      indices: [0, 1, 2]
+      weight: 1.0
+    rotation:
+      indices: [3, 4, 5, 6, 7, 8]
+      weight: 1.0
+    gripper:
+      indices: [9]
+      weight: 1.0
+  action_group_history_params:
+    enabled: false
+    shift: ${n_action_steps}
+    groups:
+      translation:
+        indices: [0, 1, 2]
+        use_history: true
+        update_rate: 1.0
+      rotation:
+        indices: [3, 4, 5, 6, 7, 8]
+        use_history: true
+        update_rate: 1.0
+      gripper:
+        indices: [9]
+        use_history: false
+        update_rate: 1.0
+  history_training_mode: legacy_shift
+  action_group_timing_params:
+    gripper:
+      enabled: false
+      indices: [9]
+      close_threshold: 0.0
+      close_is_greater: true
+      close_value: null
+      min_close_steps: 2
+      max_latch_chunks_after_close: null
+  action_phase_loss_params:
+    enabled: false
+    weight: 0.006
+    gripper_indices: [9]
+    close_threshold: 0.0
+    close_is_greater: true
+    transition_radius: 2
+    translation_indices: [0, 1, 2]
+    translation_weight: 1.5
+    rotation_indices: [3, 4, 5, 6, 7, 8]
+    rotation_weight: 1.5
+    gripper_weight: 1.8
+    release_enabled: false
+    release_transition_radius: 3
+    release_translation_indices: [0, 1, 2]
+    release_translation_weight: 1.5
+    release_rotation_indices: [3, 4, 5, 6, 7, 8]
+    release_rotation_weight: 1.8
+    release_gripper_weight: 0.8
+    extra_windows:
+      pick_place:
+        enabled: false
+        anchor: close
+        occurrence: first
+        before: 3
+        after: 4
+        start: 0.20
+        end: 0.55
+        translation_indices: [0, 1, 2]
+        translation_weight: 1.2
+        rotation_indices: [3, 4, 5, 6, 7, 8]
+        rotation_weight: 1.8
+        gripper_indices: [9]
+        gripper_weight: 1.2
+      hang_place:
+        enabled: false
+        anchor: release
+        occurrence: first
+        before: 5
+        after: 2
+        start: 0.55
+        end: 1.00
+        translation_indices: [0, 1, 2]
+        translation_weight: 2.4
+        rotation_indices: [3, 4, 5, 6, 7, 8]
+        rotation_weight: 3.0
+        gripper_indices: [9]
+        gripper_weight: 0.6
+      regrasp_insert:
+        enabled: false
+        anchor: close
+        occurrence: second
+        before: 2
+        after: 6
+        translation_indices: [0, 1, 2]
+        translation_weight: 0.8
+        rotation_indices: [3, 4, 5, 6, 7, 8]
+        rotation_weight: 1.2
+        gripper_indices: [9]
+        gripper_weight: 0.2
+      final_release:
+        enabled: false
+        anchor: release
+        occurrence: last
+        before: 4
+        after: 2
+        translation_indices: [0, 1, 2]
+        translation_weight: 0.7
+        rotation_indices: [3, 4, 5, 6, 7, 8]
+        rotation_weight: 1.0
+        gripper_indices: [9]
+        gripper_weight: 0.6
 
 task:
   abs_action: true
   action_dim: ${action_dim}
-  dataset_path: data/robomimic/datasets/lift/ph/low_dim_abs.hdf5
+  dataset_path: data/robomimic/datasets/tool_hang/ph/low_dim_abs.hdf5
   dataset_type: ph
   dataset:
     _target_: diffusion_policy.dataset.robomimic_replay_lowdim_dataset.RobomimicReplayLowdimDataset
@@ -169,25 +279,36 @@ task:
     val_ratio: ${data_split.val_ratio}
     max_train_episodes: ${data_split.max_train_episodes}
     use_legacy_normalizer: false
+    normalizer_use_full_dataset: true
+    episode_prefix_enabled: false
+    episode_prefix_anchor: first_close
+    episode_prefix_close_threshold: 0.0
+    episode_prefix_close_is_greater: true
+    episode_prefix_after: 48
+    episode_prefix_min_steps: 80
+    episode_prefix_max_steps: 160
+    episode_prefix_min_anchor_ratio: 0.9
   env_runner:
     _target_: diffusion_policy.env_runner.robomimic_lowdim_runner.RobomimicLowdimRunner
     abs_action: true
+    action_clip_by_dataset: false
+    action_clip_margin_scale: 0.25
+    action_clip_min_margin: 0.05
     crf: 22
     dataset_path: ${task.dataset_path}
     fps: 10
-    max_steps: 400
+    max_steps: 700
     n_action_steps: ${n_action_steps}
     n_envs: 28
     n_latency_steps: ${n_latency_steps}
     n_obs_steps: ${n_obs_steps}
     n_test: 50
-    n_test_vis: 3
+    n_test_vis: 4
     n_train: 6
     n_train_vis: 2
     obs_keys: [object, robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos]
     past_action: false
     render_hw: [128, 128]
     test_start_seed: 100000
-    tqdm_interval_sec: 1.0
     train_start_idx: 0
     output_dir: ${hydra:runtime.output_dir}

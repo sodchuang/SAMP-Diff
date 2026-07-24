@@ -1,0 +1,5 @@
+# Install this only when RoboMimic / robosuite evaluation is needed.
+# The system packages in VM_REBUILD_GUIDE.md must be installed first.
+free-mujoco-py==2.1.6
+robosuite @ https://github.com/cheng-chi/robosuite/archive/277ab9588ad7a4f4b55cf75508b44aa67ec171f0.tar.gz
+dm-control==1.0.9

@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 # Batch runner for eval.py on PushT ablation checkpoints.
 #
