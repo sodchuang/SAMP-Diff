@@ -256,8 +256,13 @@ next_target_epoch() {
   python -c "cur=int('${cur}')
 chunk=int('${CHUNK_EPOCHS}')
 first=int('${FIRST_EVAL_EPOCH}') + 1
-target=max(cur + chunk, first)
-print(target)"
+every=int('${ROLLOUT_EVERY}')
+desired=max(cur + chunk, first)
+# num_epochs is exclusive. Round the final trained epoch up to a rollout
+# boundary so every chunk finishes with a fresh simulator metric.
+last_epoch=desired - 1
+rollout_epoch=((last_epoch + every - 1) // every) * every
+print(max(desired, rollout_epoch + 1))"
 }
 
 run_stage_chunk() {
@@ -419,6 +424,7 @@ run_until_pass() {
   local ckpt
   local metric
   local metric_epoch=-1
+  local expected_metric_epoch=-1
   local minimum_epoch=0
   local maximum_epoch=0
   local pass_count=0
@@ -490,7 +496,9 @@ run_until_pass() {
     target="$(next_target_epoch "${run_name}")"
     if [[ -z "${ckpt}" && -n "${init_resume_path}" ]]; then
       source_epoch="$(checkpoint_epoch "${init_resume_path}")"
-      source_target=$((source_epoch + CHUNK_EPOCHS))
+      # The checkpoint epoch is inclusive while num_epochs is exclusive.
+      # +1 makes the transfer chunk end on source_epoch + CHUNK_EPOCHS.
+      source_target=$((source_epoch + CHUNK_EPOCHS + 1))
       if [[ "${target}" -lt "${source_target}" ]]; then
         echo "[AUTO] transfer checkpoint epoch=${source_epoch}; raising target_epoch from ${target} to ${source_target}"
         target="${source_target}"
@@ -506,14 +514,18 @@ run_until_pass() {
     score="$(latest_score "${run_name}" "${metric}")"
     cur="$(current_epoch "${run_name}")"
     metric_epoch="$(latest_metric_epoch "${run_name}" "${metric}")"
+    # Rollout is scheduled only on multiples of ROLLOUT_EVERY. A chunk may be
+    # capped at a non-rollout epoch, so compare against the latest epoch where
+    # rollout was actually due, not blindly against cur - 1.
+    expected_metric_epoch=$(( ((cur - 1) / ROLLOUT_EVERY) * ROLLOUT_EVERY ))
     if [[ "${score}" == "nan" ]]; then
       echo "[ERROR] ${stage} completed a training chunk but '${metric}' was never logged." >&2
       echo "[ERROR] This is an eval/code-bundle failure, not a zero success rate." >&2
       echo "[ERROR] Stop now instead of spending more epochs without a usable gate." >&2
       exit 5
     fi
-    if [[ "${metric_epoch}" -ne $((cur - 1)) ]]; then
-      echo "[ERROR] ${stage} latest metric is stale: metric_epoch=${metric_epoch}, expected=$((cur - 1))." >&2
+    if [[ "${metric_epoch}" -ne "${expected_metric_epoch}" ]]; then
+      echo "[ERROR] ${stage} latest metric is stale: metric_epoch=${metric_epoch}, expected=${expected_metric_epoch}." >&2
       echo "[ERROR] The current rollout failed or was skipped; refusing to train or switch stages using an older score." >&2
       exit 5
     fi
