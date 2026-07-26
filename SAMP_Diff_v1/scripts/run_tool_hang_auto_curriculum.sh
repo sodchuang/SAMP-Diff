@@ -318,10 +318,9 @@ run_stage_chunk() {
       ;;
 
     B_INSERT)
-      # B v3 deliberately keeps A's rollout cadence and uses a smaller transfer
-      # learning rate.  The previous B used 2-step replanning, lr=1e-4 and very
-      # strong insertion rotation losses; rollout inspection showed that those
-      # settings destroyed the already-learned grasp before insertion emerged.
+      # B v4 keeps A's stable grasp and makes the first release transition
+      # learnable.  Long close latching and a one-step post-release window made
+      # v3 hover over the stand without seating or releasing the frame.
       RUN_NAME="${run_name}" \
       NUM_EPOCHS="${target_epoch}" \
       ROLLOUT_START_EPOCH="${FIRST_EVAL_EPOCH}" \
@@ -337,13 +336,13 @@ run_stage_chunk() {
       TRAIN_LR="${B_TRAIN_LR:-0.00001}" \
       N_ACTION_STEPS="${B_N_ACTION_STEPS:-4}" \
       HISTORY_SHIFT="${B_HISTORY_SHIFT:-4}" \
-      PHASE_LOSS_WEIGHT="${B_PHASE_LOSS_WEIGHT:-0.006}" \
+      PHASE_LOSS_WEIGHT="${B_PHASE_LOSS_WEIGHT:-0.012}" \
       TRANSLATION_WEIGHT="${B_TRANSLATION_WEIGHT:-1.6}" \
       ROTATION_WEIGHT="${B_ROTATION_WEIGHT:-0.8}" \
       GRIPPER_WEIGHT="${B_GRIPPER_WEIGHT:-3.6}" \
       GRIPPER_TIMING_ENABLED=true \
       MIN_CLOSE_STEPS="${B_MIN_CLOSE_STEPS:-12}" \
-      MAX_LATCH_CHUNKS_AFTER_CLOSE="${B_MAX_LATCH_CHUNKS_AFTER_CLOSE:-20}" \
+      MAX_LATCH_CHUNKS_AFTER_CLOSE="${B_MAX_LATCH_CHUNKS_AFTER_CLOSE:-12}" \
       PICK_WINDOW_BEFORE="${B_PICK_WINDOW_BEFORE:-8}" \
       PICK_WINDOW_AFTER="${B_PICK_WINDOW_AFTER:-24}" \
       PICK_WINDOW_TRANSLATION_WEIGHT="${B_PICK_WINDOW_TRANSLATION_WEIGHT:-3.0}" \
@@ -356,18 +355,18 @@ run_stage_chunk() {
       EPISODE_PREFIX_MAX_STEPS="${B_EPISODE_PREFIX_MAX_STEPS:-320}" \
       HANG_WINDOW_ANCHOR=release \
       HANG_WINDOW_OCCURRENCE=first \
-      HANG_WINDOW_BEFORE="${B_HANG_WINDOW_BEFORE:-15}" \
-      HANG_WINDOW_AFTER="${B_HANG_WINDOW_AFTER:-1}" \
-      HANG_WINDOW_TRANSLATION_WEIGHT="${B_HANG_WINDOW_TRANSLATION_WEIGHT:-2.0}" \
-      HANG_WINDOW_ROTATION_WEIGHT="${B_HANG_WINDOW_ROTATION_WEIGHT:-2.4}" \
-      HANG_WINDOW_GRIPPER_WEIGHT="${B_HANG_WINDOW_GRIPPER_WEIGHT:-0.5}" \
+      HANG_WINDOW_BEFORE="${B_HANG_WINDOW_BEFORE:-32}" \
+      HANG_WINDOW_AFTER="${B_HANG_WINDOW_AFTER:-16}" \
+      HANG_WINDOW_TRANSLATION_WEIGHT="${B_HANG_WINDOW_TRANSLATION_WEIGHT:-2.8}" \
+      HANG_WINDOW_ROTATION_WEIGHT="${B_HANG_WINDOW_ROTATION_WEIGHT:-3.0}" \
+      HANG_WINDOW_GRIPPER_WEIGHT="${B_HANG_WINDOW_GRIPPER_WEIGHT:-2.4}" \
       REGRASP_WINDOW_ENABLED=false \
       FINAL_RELEASE_WINDOW_ENABLED=false \
       RELEASE_ENABLED=true \
-      RELEASE_TRANSITION_RADIUS="${B_RELEASE_TRANSITION_RADIUS:-4}" \
-      RELEASE_TRANSLATION_WEIGHT="${B_RELEASE_TRANSLATION_WEIGHT:-1.6}" \
-      RELEASE_ROTATION_WEIGHT="${B_RELEASE_ROTATION_WEIGHT:-2.0}" \
-      RELEASE_GRIPPER_WEIGHT="${B_RELEASE_GRIPPER_WEIGHT:-0.7}" \
+      RELEASE_TRANSITION_RADIUS="${B_RELEASE_TRANSITION_RADIUS:-12}" \
+      RELEASE_TRANSLATION_WEIGHT="${B_RELEASE_TRANSLATION_WEIGHT:-2.4}" \
+      RELEASE_ROTATION_WEIGHT="${B_RELEASE_ROTATION_WEIGHT:-2.8}" \
+      RELEASE_GRIPPER_WEIGHT="${B_RELEASE_GRIPPER_WEIGHT:-3.2}" \
       bash scripts/run_tool_hang_rescue.sh FLOW
       ;;
 
