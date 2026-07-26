@@ -277,9 +277,9 @@ run_stage_chunk() {
 
   case "${stage}" in
     A_HOLD)
-      # Restore the original HG recipe that produced the strongest early
-      # ToolHang grasp behavior. Keep only the new simulator-state gate; do not
-      # add the later LIFT prefix, close latch, or heavy pick-window losses.
+      # Use the actual HG grasp recipe. The previous auto-stage accidentally
+      # disabled HG's phase loss, close latch and pick window while claiming to
+      # restore it; rollout grasp rate consequently plateaued around 0.4-0.55.
       RUN_NAME="${run_name}" \
       NUM_EPOCHS="${target_epoch}" \
       ROLLOUT_START_EPOCH="${FIRST_EVAL_EPOCH}" \
@@ -299,18 +299,25 @@ run_stage_chunk() {
       ACTION_CLIP_BY_DATASET=true \
       ACTION_CLIP_MARGIN_SCALE="${A_ACTION_CLIP_MARGIN_SCALE:-0.10}" \
       ACTION_CLIP_MIN_MARGIN="${A_ACTION_CLIP_MIN_MARGIN:-0.02}" \
-      PHASE_LOSS_ENABLED=false \
-      PHASE_LOSS_WEIGHT="${A_PHASE_LOSS_WEIGHT:-0.004}" \
-      TRANSLATION_WEIGHT="${A_TRANSLATION_WEIGHT:-1.2}" \
-      ROTATION_WEIGHT="${A_ROTATION_WEIGHT:-1.2}" \
-      GRIPPER_WEIGHT="${A_GRIPPER_WEIGHT:-1.6}" \
-      ROTATION_SIGMA="${A_ROTATION_SIGMA:-0.12}" \
-      GRIPPER_TIMING_ENABLED=false \
+      PHASE_LOSS_ENABLED=true \
+      PHASE_LOSS_WEIGHT="${A_PHASE_LOSS_WEIGHT:-0.013}" \
+      TRANSLATION_WEIGHT="${A_TRANSLATION_WEIGHT:-2.7}" \
+      ROTATION_WEIGHT="${A_ROTATION_WEIGHT:-0.30}" \
+      GRIPPER_WEIGHT="${A_GRIPPER_WEIGHT:-4.6}" \
+      ROTATION_SIGMA="${A_ROTATION_SIGMA:-0.07}" \
+      GRIPPER_TIMING_ENABLED=true \
+      MIN_CLOSE_STEPS="${A_MIN_CLOSE_STEPS:-12}" \
+      MAX_LATCH_CHUNKS_AFTER_CLOSE="${A_MAX_LATCH_CHUNKS_AFTER_CLOSE:-24}" \
+      PICK_WINDOW_BEFORE="${A_PICK_WINDOW_BEFORE:-8}" \
+      PICK_WINDOW_AFTER="${A_PICK_WINDOW_AFTER:-24}" \
+      PICK_WINDOW_TRANSLATION_WEIGHT="${A_PICK_WINDOW_TRANSLATION_WEIGHT:-3.6}" \
+      PICK_WINDOW_ROTATION_WEIGHT="${A_PICK_WINDOW_ROTATION_WEIGHT:-0.25}" \
+      PICK_WINDOW_GRIPPER_WEIGHT="${A_PICK_WINDOW_GRIPPER_WEIGHT:-5.2}" \
       EPISODE_PREFIX_ENABLED=true \
       EPISODE_PREFIX_ANCHOR=first_close \
-      EPISODE_PREFIX_AFTER="${A_EPISODE_PREFIX_AFTER:-64}" \
-      EPISODE_PREFIX_MIN_STEPS="${A_EPISODE_PREFIX_MIN_STEPS:-96}" \
-      EPISODE_PREFIX_MAX_STEPS="${A_EPISODE_PREFIX_MAX_STEPS:-160}" \
+      EPISODE_PREFIX_AFTER="${A_EPISODE_PREFIX_AFTER:-80}" \
+      EPISODE_PREFIX_MIN_STEPS="${A_EPISODE_PREFIX_MIN_STEPS:-110}" \
+      EPISODE_PREFIX_MAX_STEPS="${A_EPISODE_PREFIX_MAX_STEPS:-200}" \
       REGRASP_WINDOW_ENABLED=false \
       FINAL_RELEASE_WINDOW_ENABLED=false \
       RELEASE_ENABLED=false \
