@@ -180,7 +180,10 @@ class RobomimicLowdimWrapper(gym.Env):
 
         raw = {
             'grasp': grasped and lifted,
-            'insert': assembled and not grasped,
+            # Stage B only verifies that the frame reaches and remains in the
+            # assembled pose. Requiring an open gripper here duplicates the
+            # release objective from Stage C and encourages premature drops.
+            'insert': assembled,
             'full': full,
         }
         thresholds = {

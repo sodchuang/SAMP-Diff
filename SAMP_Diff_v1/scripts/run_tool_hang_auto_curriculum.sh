@@ -318,9 +318,9 @@ run_stage_chunk() {
       ;;
 
     B_INSERT)
-      # B v4 keeps A's stable grasp and makes the first release transition
-      # learnable.  Long close latching and a one-step post-release window made
-      # v3 hover over the stand without seating or releasing the frame.
+      # B v5 learns stable frame assembly while keeping the grasp. Release is
+      # deliberately deferred to C; otherwise the insert stage learns to drop
+      # the frame near the stand before it is seated.
       RUN_NAME="${run_name}" \
       NUM_EPOCHS="${target_epoch}" \
       ROLLOUT_START_EPOCH="${FIRST_EVAL_EPOCH}" \
@@ -342,7 +342,7 @@ run_stage_chunk() {
       GRIPPER_WEIGHT="${B_GRIPPER_WEIGHT:-3.6}" \
       GRIPPER_TIMING_ENABLED=true \
       MIN_CLOSE_STEPS="${B_MIN_CLOSE_STEPS:-12}" \
-      MAX_LATCH_CHUNKS_AFTER_CLOSE="${B_MAX_LATCH_CHUNKS_AFTER_CLOSE:-12}" \
+      MAX_LATCH_CHUNKS_AFTER_CLOSE="${B_MAX_LATCH_CHUNKS_AFTER_CLOSE:-20}" \
       PICK_WINDOW_BEFORE="${B_PICK_WINDOW_BEFORE:-8}" \
       PICK_WINDOW_AFTER="${B_PICK_WINDOW_AFTER:-24}" \
       PICK_WINDOW_TRANSLATION_WEIGHT="${B_PICK_WINDOW_TRANSLATION_WEIGHT:-3.0}" \
@@ -355,18 +355,14 @@ run_stage_chunk() {
       EPISODE_PREFIX_MAX_STEPS="${B_EPISODE_PREFIX_MAX_STEPS:-320}" \
       HANG_WINDOW_ANCHOR=release \
       HANG_WINDOW_OCCURRENCE=first \
-      HANG_WINDOW_BEFORE="${B_HANG_WINDOW_BEFORE:-32}" \
-      HANG_WINDOW_AFTER="${B_HANG_WINDOW_AFTER:-16}" \
-      HANG_WINDOW_TRANSLATION_WEIGHT="${B_HANG_WINDOW_TRANSLATION_WEIGHT:-2.8}" \
-      HANG_WINDOW_ROTATION_WEIGHT="${B_HANG_WINDOW_ROTATION_WEIGHT:-3.0}" \
-      HANG_WINDOW_GRIPPER_WEIGHT="${B_HANG_WINDOW_GRIPPER_WEIGHT:-2.4}" \
+      HANG_WINDOW_BEFORE="${B_HANG_WINDOW_BEFORE:-40}" \
+      HANG_WINDOW_AFTER="${B_HANG_WINDOW_AFTER:-0}" \
+      HANG_WINDOW_TRANSLATION_WEIGHT="${B_HANG_WINDOW_TRANSLATION_WEIGHT:-3.2}" \
+      HANG_WINDOW_ROTATION_WEIGHT="${B_HANG_WINDOW_ROTATION_WEIGHT:-3.4}" \
+      HANG_WINDOW_GRIPPER_WEIGHT="${B_HANG_WINDOW_GRIPPER_WEIGHT:-0.0}" \
       REGRASP_WINDOW_ENABLED=false \
       FINAL_RELEASE_WINDOW_ENABLED=false \
-      RELEASE_ENABLED=true \
-      RELEASE_TRANSITION_RADIUS="${B_RELEASE_TRANSITION_RADIUS:-12}" \
-      RELEASE_TRANSLATION_WEIGHT="${B_RELEASE_TRANSLATION_WEIGHT:-2.4}" \
-      RELEASE_ROTATION_WEIGHT="${B_RELEASE_ROTATION_WEIGHT:-2.8}" \
-      RELEASE_GRIPPER_WEIGHT="${B_RELEASE_GRIPPER_WEIGHT:-3.2}" \
+      RELEASE_ENABLED=false \
       bash scripts/run_tool_hang_rescue.sh FLOW
       ;;
 
