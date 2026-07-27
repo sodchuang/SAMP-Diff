@@ -181,19 +181,61 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
             raise ValueError(
                 "training.lr_scheduler_num_epochs must be positive"
             )
+        gradient_accumulate_every = int(
+            cfg.training.gradient_accumulate_every
+        )
+        if gradient_accumulate_every <= 0:
+            raise ValueError(
+                "training.gradient_accumulate_every must be positive"
+            )
+        scheduler_total_steps = (
+            len(train_dataloader) * scheduler_num_epochs
+        ) // gradient_accumulate_every
+        if scheduler_total_steps <= 0:
+            raise ValueError(
+                "LR scheduler has no training steps; check dataloader size "
+                "and gradient accumulation"
+            )
+
+        # global_step is a batch counter saved by the previous process. It
+        # cannot be used as scheduler progress after a dataset/prefix change,
+        # because the number of batches per epoch may be different. That made
+        # a resumed ToolHang run at epoch 1100 look almost finished against a
+        # 3001-epoch horizon and collapsed its LR to ~5e-8. Reconstruct the
+        # scheduler position from the semantic epoch and the current loader.
+        if cross_stage_transfer:
+            scheduler_resume_step = 0
+        else:
+            completed_batches = max(0, int(self.epoch)) * len(train_dataloader)
+            scheduler_resume_step = (
+                completed_batches + gradient_accumulate_every - 1
+            ) // gradient_accumulate_every
+            scheduler_resume_step = min(
+                scheduler_resume_step, scheduler_total_steps - 1
+            )
+
+        # Optimizer checkpoints can also carry an initial_lr from an obsolete
+        # chunk scheduler. Anchor every resumed scheduler to this run's
+        # configured base LR before LambdaLR reads the parameter groups.
+        configured_base_lr = float(cfg.optimizer.lr)
+        for param_group in self.optimizer.param_groups:
+            param_group['initial_lr'] = configured_base_lr
+            param_group['lr'] = configured_base_lr
+
         print(
             "[Training] fixed LR scheduler horizon: "
             f"{scheduler_num_epochs} epochs "
-            f"(this process stops at {cfg.training.num_epochs})"
+            f"(this process stops at {cfg.training.num_epochs}); "
+            f"resume_step={scheduler_resume_step}/"
+            f"{scheduler_total_steps}, epoch={self.epoch}, "
+            f"saved_global_step={self.global_step}"
         )
         lr_scheduler = get_scheduler(
             cfg.training.lr_scheduler,
             optimizer=self.optimizer,
             num_warmup_steps=cfg.training.lr_warmup_steps,
-            num_training_steps=(
-                len(train_dataloader) * scheduler_num_epochs
-            ) // cfg.training.gradient_accumulate_every,
-            last_epoch=self.global_step - 1,
+            num_training_steps=scheduler_total_steps,
+            last_epoch=scheduler_resume_step - 1,
         )
 
         # configure ema
