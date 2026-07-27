@@ -23,11 +23,11 @@ set -euo pipefail
 #   A_PASS_SCORE=0.80 B_PASS_SCORE=0.50 C_PASS_SCORE=0.50 bash scripts/run_tool_hang_auto_curriculum.sh
 #   MAX_STAGE_EPOCHS=3000 CHUNK_EPOCHS=200 bash scripts/run_tool_hang_auto_curriculum.sh
 
-PIPELINE_VERSION="toolhang_direction_guard_v5_rolling"
-BASE_RUN_NAME="${BASE_RUN_NAME:-tool_hang_auto_direction_guard_v5_rolling}"
-CHUNK_EPOCHS="${CHUNK_EPOCHS:-200}"
+PIPELINE_VERSION="toolhang_direction_guard_v6_continuous"
+BASE_RUN_NAME="${BASE_RUN_NAME:-tool_hang_auto_direction_guard_v6_continuous}"
+CHUNK_EPOCHS="${CHUNK_EPOCHS:-50}"
 FIRST_EVAL_EPOCH="${FIRST_EVAL_EPOCH:-300}"
-ROLLOUT_EVERY="${ROLLOUT_EVERY:-100}"
+ROLLOUT_EVERY="${ROLLOUT_EVERY:-50}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-50}"
 N_ENVS="${N_ENVS:-8}"
 MAX_STAGE_EPOCHS="${MAX_STAGE_EPOCHS:-7000}"
@@ -38,7 +38,9 @@ B_PASS_SCORE="${B_PASS_SCORE:-0.50}"
 C_PASS_SCORE="${C_PASS_SCORE:-0.50}"
 B_PASS_ADDED_EPOCHS="${B_PASS_ADDED_EPOCHS:-2000}"
 B_FREEZE_ENCODER_ADDED_EPOCHS="${B_FREEZE_ENCODER_ADDED_EPOCHS:-300}"
-REQUIRED_CONSECUTIVE_PASSES="${REQUIRED_CONSECUTIVE_PASSES:-2}"
+A_REQUIRED_CONSECUTIVE_PASSES="${A_REQUIRED_CONSECUTIVE_PASSES:-1}"
+B_REQUIRED_CONSECUTIVE_PASSES="${B_REQUIRED_CONSECUTIVE_PASSES:-2}"
+C_REQUIRED_CONSECUTIVE_PASSES="${C_REQUIRED_CONSECUTIVE_PASSES:-2}"
 ROLLING_BEST_CHECKPOINT="${ROLLING_BEST_CHECKPOINT:-true}"
 A_MIN_EPOCH="${A_MIN_EPOCH:-300}"
 A_DIRECTION_CHECK_EPOCH="${A_DIRECTION_CHECK_EPOCH:-1200}"
@@ -124,6 +126,16 @@ stage_gate_metric() {
     A_HOLD) echo "test/stage_grasp_rate" ;;
     B_INSERT) echo "test/stage_insert_rate" ;;
     C_FULL) echo "test/stage_full_rate" ;;
+    *) echo "[ERROR] unknown stage ${stage}" >&2; exit 2 ;;
+  esac
+}
+
+stage_required_consecutive() {
+  local stage="$1"
+  case "${stage}" in
+    A_HOLD) echo "${A_REQUIRED_CONSECUTIVE_PASSES}" ;;
+    B_INSERT) echo "${B_REQUIRED_CONSECUTIVE_PASSES}" ;;
+    C_FULL) echo "${C_REQUIRED_CONSECUTIVE_PASSES}" ;;
     *) echo "[ERROR] unknown stage ${stage}" >&2; exit 2 ;;
   esac
 }
@@ -332,6 +344,7 @@ run_stage_chunk() {
       echo "[AUTO] A recipe=direction_guard_v4_exact phase_loss=false timing=false weights=1.2/1.2/1.6 prefix=64/96/160 variant=HG"
       RUN_NAME="${run_name}" \
       NUM_EPOCHS="${target_epoch}" \
+      LR_SCHEDULER_NUM_EPOCHS="$((A_MAX_EPOCHS + 1))" \
       ROLLOUT_START_EPOCH="${FIRST_EVAL_EPOCH}" \
       ROLLOUT_EVERY="${ROLLOUT_EVERY}" \
       CHECKPOINT_EVERY="${CHECKPOINT_EVERY}" \
@@ -374,6 +387,7 @@ run_stage_chunk() {
       echo "[AUTO] B recipe=insert_only_v5 lr=1e-5 action_steps=4 release=false metric=stage_insert_rate"
       RUN_NAME="${run_name}" \
       NUM_EPOCHS="${target_epoch}" \
+      LR_SCHEDULER_NUM_EPOCHS="${MAX_STAGE_EPOCHS}" \
       ROLLOUT_START_EPOCH="${FIRST_EVAL_EPOCH}" \
       ROLLOUT_EVERY="${ROLLOUT_EVERY}" \
       CHECKPOINT_EVERY="${CHECKPOINT_EVERY}" \
@@ -420,6 +434,7 @@ run_stage_chunk() {
     C_FULL)
       RUN_NAME="${run_name}" \
       NUM_EPOCHS="${target_epoch}" \
+      LR_SCHEDULER_NUM_EPOCHS="${MAX_STAGE_EPOCHS}" \
       ROLLOUT_START_EPOCH="${FIRST_EVAL_EPOCH}" \
       ROLLOUT_EVERY="${ROLLOUT_EVERY}" \
       CHECKPOINT_EVERY="${CHECKPOINT_EVERY}" \
@@ -474,11 +489,13 @@ run_until_pass() {
   local minimum_epoch=0
   local maximum_epoch=0
   local pass_count=0
+  local required_passes=0
   local BEST_CKPT=""
 
   run_name="$(stage_run_name "${stage}")"
   threshold="$(stage_pass_score "${stage}")"
   metric="$(stage_gate_metric "${stage}")"
+  required_passes="$(stage_required_consecutive "${stage}")"
 
   case "${stage}" in
     A_HOLD)
@@ -500,7 +517,7 @@ run_until_pass() {
   esac
 
   echo
-  echo "[AUTO] ===== ${stage} (${run_name}) threshold=${threshold} metric=${metric} min_epoch=${minimum_epoch} max_epoch=${maximum_epoch} consecutive=${REQUIRED_CONSECUTIVE_PASSES} ====="
+  echo "[AUTO] ===== ${stage} (${run_name}) threshold=${threshold} metric=${metric} min_epoch=${minimum_epoch} max_epoch=${maximum_epoch} consecutive=${required_passes} ====="
   while true; do
     cur="$(current_epoch "${run_name}")"
     score="$(latest_score "${run_name}" "${metric}")"
@@ -509,7 +526,7 @@ run_until_pass() {
     ckpt="$(latest_ckpt "${run_name}")"
     metric_epoch="$(latest_metric_epoch "${run_name}" "${metric}")"
     record_best_checkpoint "${stage}" "${run_name}" "${metric}" "${score}" "${metric_epoch}"
-    if [[ "${passed}" == "yes" && "${cur}" -ge "${minimum_epoch}" && "${pass_count}" -ge "${REQUIRED_CONSECUTIVE_PASSES}" && -n "${ckpt}" ]]; then
+    if [[ "${passed}" == "yes" && "${cur}" -ge "${minimum_epoch}" && "${pass_count}" -ge "${required_passes}" && -n "${ckpt}" ]]; then
       echo "[AUTO] ${stage} gate was already passed: ${metric}=${score}, epoch=${cur}, consecutive=${pass_count}."
       PASSED_CKPT="${BEST_CKPT:-${ckpt}}"
       echo "[AUTO] ${stage} transfer checkpoint: ${PASSED_CKPT}"
@@ -582,7 +599,7 @@ run_until_pass() {
     passed="$(score_passed "${score}" "${threshold}")"
     pass_count="$(consecutive_passes "${run_name}" "${metric}" "${threshold}")"
     record_best_checkpoint "${stage}" "${run_name}" "${metric}" "${score}" "${metric_epoch}"
-    echo "[AUTO] ${stage} latest ${metric}=${score}, threshold=${threshold}, epoch=${cur}/${minimum_epoch}, consecutive=${pass_count}/${REQUIRED_CONSECUTIVE_PASSES}"
+    echo "[AUTO] ${stage} latest ${metric}=${score}, threshold=${threshold}, epoch=${cur}/${minimum_epoch}, consecutive=${pass_count}/${required_passes}"
     if [[ "${stage}" == "A_HOLD" ]]; then
       contact_score="$(latest_score "${run_name}" "test/frame_grasp_contact_rate")"
       lift_score="$(latest_score "${run_name}" "test/frame_lift_rate")"
@@ -615,7 +632,7 @@ run_until_pass() {
       fi
     fi
 
-    if [[ "${passed}" == "yes" && "${cur}" -ge "${minimum_epoch}" && "${pass_count}" -ge "${REQUIRED_CONSECUTIVE_PASSES}" ]]; then
+    if [[ "${passed}" == "yes" && "${cur}" -ge "${minimum_epoch}" && "${pass_count}" -ge "${required_passes}" ]]; then
       ckpt="$(latest_ckpt "${run_name}")"
       if [[ -z "${ckpt}" ]]; then
         echo "[ERROR] ${stage} passed but latest checkpoint is missing for ${run_name}." >&2
