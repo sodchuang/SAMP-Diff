@@ -197,16 +197,31 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
                 "and gradient accumulation"
             )
 
+        scheduler_start_epoch = int(
+            cfg.training.get('lr_scheduler_start_epoch', 0)
+        )
+        if scheduler_start_epoch < 0:
+            raise ValueError(
+                "training.lr_scheduler_start_epoch must be non-negative"
+            )
+
         # global_step is a batch counter saved by the previous process. It
         # cannot be used as scheduler progress after a dataset/prefix change,
         # because the number of batches per epoch may be different. That made
         # a resumed ToolHang run at epoch 1100 look almost finished against a
-        # 3001-epoch horizon and collapsed its LR to ~5e-8. Reconstruct the
-        # scheduler position from the semantic epoch and the current loader.
+        # 3001-epoch horizon and collapsed its LR to ~5e-8. A transferred
+        # curriculum stage also inherits the source checkpoint's absolute
+        # epoch, so its scheduler must count only epochs added by this stage.
+        # Reconstruct progress from stage-relative epoch and the current loader.
         if cross_stage_transfer:
             scheduler_resume_step = 0
         else:
-            completed_batches = max(0, int(self.epoch)) * len(train_dataloader)
+            completed_stage_epochs = max(
+                0, int(self.epoch) - scheduler_start_epoch
+            )
+            completed_batches = (
+                completed_stage_epochs * len(train_dataloader)
+            )
             scheduler_resume_step = (
                 completed_batches + gradient_accumulate_every - 1
             ) // gradient_accumulate_every
@@ -228,6 +243,7 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
             f"(this process stops at {cfg.training.num_epochs}); "
             f"resume_step={scheduler_resume_step}/"
             f"{scheduler_total_steps}, epoch={self.epoch}, "
+            f"stage_start_epoch={scheduler_start_epoch}, "
             f"saved_global_step={self.global_step}"
         )
         lr_scheduler = get_scheduler(
@@ -237,6 +253,26 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
             num_training_steps=scheduler_total_steps,
             last_epoch=scheduler_resume_step - 1,
         )
+        effective_lr = float(lr_scheduler.get_last_lr()[0])
+        scheduler_progress = (
+            float(scheduler_resume_step) / float(scheduler_total_steps)
+        )
+        print(
+            "[Training] LR scheduler initialized: "
+            f"effective_lr={effective_lr:.8g}, "
+            f"progress={scheduler_progress:.4f}"
+        )
+        if (
+            scheduler_resume_step > int(cfg.training.lr_warmup_steps)
+            and scheduler_progress < 0.95
+            and effective_lr < configured_base_lr * 1e-4
+        ):
+            raise RuntimeError(
+                "LR scheduler initialized at an effectively zero learning "
+                f"rate ({effective_lr:.8g}) while only "
+                f"{scheduler_progress:.1%} through this stage. Refusing to "
+                "continue a silently stalled run."
+            )
 
         # configure ema
         ema: EMAModel = None

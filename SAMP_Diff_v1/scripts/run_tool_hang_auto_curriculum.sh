@@ -23,7 +23,7 @@ set -euo pipefail
 #   A_PASS_SCORE=0.80 B_PASS_SCORE=0.50 C_PASS_SCORE=0.50 bash scripts/run_tool_hang_auto_curriculum.sh
 #   MAX_STAGE_EPOCHS=3000 CHUNK_EPOCHS=200 bash scripts/run_tool_hang_auto_curriculum.sh
 
-PIPELINE_VERSION="toolhang_direction_guard_v7_adaptive"
+PIPELINE_VERSION="toolhang_direction_guard_v8_isolated"
 BASE_RUN_NAME="${BASE_RUN_NAME:-}"
 CHUNK_EPOCHS="${CHUNK_EPOCHS:-50}"
 FIRST_EVAL_EPOCH="${FIRST_EVAL_EPOCH:-300}"
@@ -61,8 +61,11 @@ C_MIN_ADDED_EPOCHS="${C_MIN_ADDED_EPOCHS:-500}"
 ALLOW_STAGE_B="${ALLOW_STAGE_B:-true}"
 ALLOW_STAGE_C="${ALLOW_STAGE_C:-true}"
 A_CHECKPOINT_PATH="${A_CHECKPOINT_PATH:-}"
-AUTO_RESUME_LATEST="${AUTO_RESUME_LATEST:-true}"
+AUTO_RESUME_LATEST="${AUTO_RESUME_LATEST:-false}"
+ALLOW_LEGACY_RESUME="${ALLOW_LEGACY_RESUME:-false}"
 ACTIVE_RUN_FILE="${ACTIVE_RUN_FILE:-data/outputs/robomimic/.tool_hang_active_run}"
+ACTIVE_PIPELINE_FILE="${ACTIVE_PIPELINE_FILE:-data/outputs/robomimic/.tool_hang_active_pipeline}"
+TRAINING_LOCK_FILE="${TRAINING_LOCK_FILE:-data/outputs/robomimic/.tool_hang_training.lock}"
 
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
@@ -70,23 +73,53 @@ export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
-export WANDB_MODE="${WANDB_MODE:-offline}"
+export WANDB_MODE="${WANDB_MODE:-disabled}"
+export WANDB_SILENT="${WANDB_SILENT:-true}"
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
 
+acquire_training_lock() {
+  mkdir -p "$(dirname "${TRAINING_LOCK_FILE}")"
+  if ! command -v flock >/dev/null 2>&1; then
+    echo "[WARN] flock is unavailable; duplicate-run protection is disabled." >&2
+    return
+  fi
+  exec 9>"${TRAINING_LOCK_FILE}"
+  if ! flock -n 9; then
+    echo "[ERROR] another ToolHang curriculum process is already running." >&2
+    echo "[ERROR] lock=${TRAINING_LOCK_FILE}" >&2
+    echo "[ERROR] Stop the existing process instead of launching a duplicate." >&2
+    exit 10
+  fi
+}
+
 resolve_base_run_name() {
   local latest_run=""
+  local requested_run="${BASE_RUN_NAME}"
+  local saved_pipeline=""
+  local run_pipeline_file=""
+
   if [[ -n "${BASE_RUN_NAME}" ]]; then
-    :
-  elif [[ -f "${ACTIVE_RUN_FILE}" ]]; then
-    BASE_RUN_NAME="$(tr -d '\r\n' < "${ACTIVE_RUN_FILE}")"
-    echo "[AUTO] active run restored from ${ACTIVE_RUN_FILE}: ${BASE_RUN_NAME}"
+    echo "[AUTO] explicit run requested: ${BASE_RUN_NAME}"
+  elif [[ -f "${ACTIVE_RUN_FILE}" && -f "${ACTIVE_PIPELINE_FILE}" ]]; then
+    saved_pipeline="$(tr -d '\r\n' < "${ACTIVE_PIPELINE_FILE}")"
+    if [[ "${saved_pipeline}" == "${PIPELINE_VERSION}" ]]; then
+      BASE_RUN_NAME="$(tr -d '\r\n' < "${ACTIVE_RUN_FILE}")"
+      echo "[AUTO] active run restored from ${ACTIVE_RUN_FILE}: ${BASE_RUN_NAME}"
+    else
+      echo "[AUTO] ignoring active run from incompatible pipeline: ${saved_pipeline}"
+    fi
   elif [[ "${AUTO_RESUME_LATEST}" == "true" && -d "data/outputs/robomimic" ]]; then
-    latest_run="$(find data/outputs/robomimic -maxdepth 1 -mindepth 1 -type d \
-      -name '*_A_hold' -printf '%T@ %f\n' 2>/dev/null \
-      | sort -n | tail -1 | cut -d' ' -f2-)"
+    latest_run="$(find data/outputs/robomimic -maxdepth 1 -type f \
+      -name '*.pipeline' -print 2>/dev/null \
+      | while read -r marker; do
+          if [[ "$(tr -d '\r\n' < "${marker}")" == "${PIPELINE_VERSION}" ]]; then
+            stat -c '%Y %n' "${marker}"
+          fi
+        done | sort -n | tail -1 | cut -d' ' -f2-)"
     if [[ -n "${latest_run}" ]]; then
-      BASE_RUN_NAME="${latest_run%_A_hold}"
+      BASE_RUN_NAME="$(basename "${latest_run}" .pipeline)"
       echo "[AUTO] latest A run detected: ${BASE_RUN_NAME}"
     fi
   fi
@@ -97,7 +130,27 @@ resolve_base_run_name() {
   fi
 
   mkdir -p "$(dirname "${ACTIVE_RUN_FILE}")"
+  run_pipeline_file="data/outputs/robomimic/${BASE_RUN_NAME}.pipeline"
+  if [[ -f "${run_pipeline_file}" ]]; then
+    saved_pipeline="$(tr -d '\r\n' < "${run_pipeline_file}")"
+    if [[ "${saved_pipeline}" != "${PIPELINE_VERSION}" ]]; then
+      echo "[ERROR] ${BASE_RUN_NAME} belongs to pipeline ${saved_pipeline}, not ${PIPELINE_VERSION}." >&2
+      echo "[ERROR] Use a new BASE_RUN_NAME; refusing to mix model/data/scheduler recipes." >&2
+      exit 9
+    fi
+  elif [[ -n "${requested_run}" ]] && {
+      [[ -d "data/outputs/robomimic/${BASE_RUN_NAME}_A_hold" ]] ||
+      [[ -d "data/outputs/robomimic/${BASE_RUN_NAME}_B_insert" ]] ||
+      [[ -d "data/outputs/robomimic/${BASE_RUN_NAME}_C_full" ]];
+    } && [[ "${ALLOW_LEGACY_RESUME}" != "true" ]]; then
+    echo "[ERROR] ${BASE_RUN_NAME} has legacy outputs without a v8 pipeline fingerprint." >&2
+    echo "[ERROR] Choose a new BASE_RUN_NAME or set ALLOW_LEGACY_RESUME=true explicitly." >&2
+    exit 9
+  fi
+
+  printf '%s\n' "${PIPELINE_VERSION}" > "${run_pipeline_file}"
   printf '%s\n' "${BASE_RUN_NAME}" > "${ACTIVE_RUN_FILE}"
+  printf '%s\n' "${PIPELINE_VERSION}" > "${ACTIVE_PIPELINE_FILE}"
 }
 
 require_project_root() {
@@ -115,9 +168,12 @@ require_project_root() {
     "diffusion_policy/gym_util/multistep_wrapper.py:get_tool_hang_stage_flags"
     "diffusion_policy/dataset/robomimic_replay_lowdim_dataset.py:normalizer_use_full_dataset"
     "diffusion_policy/dataset/robomimic_replay_lowdim_dataset.py:episode prefix anchor coverage is too low"
+    "diffusion_policy/workspace/train_samp_lowdim_workspace.py:lr_scheduler_start_epoch"
     "config_task/low_dim/tool_hang_ph.yaml:normalizer_use_full_dataset: true"
     "config_task/low_dim/tool_hang_ph.yaml:episode_prefix_min_anchor_ratio: 0.9"
     "scripts/run_tool_hang_rescue.sh:policy.history_training_mode"
+    "scripts/run_tool_hang_rescue.sh:training.lr_scheduler_start_epoch"
+    "scripts/run_tool_hang_rescue.sh:logging.mode"
     "scripts/run_tool_hang_auto_curriculum.sh:A_DIRECTION_CHECK_EPOCH"
   )
   local item
@@ -467,9 +523,10 @@ run_stage_chunk() {
   local target_epoch="$3"
   local resume_mode="$4"
   local resume_path="${5:-}"
+  local scheduler_start_epoch="${6:-0}"
 
   echo
-  echo "[AUTO] stage=${stage} run=${run_name} target_epoch=${target_epoch} resume_mode=${resume_mode} resume_path=${resume_path:-none}"
+  echo "[AUTO] stage=${stage} run=${run_name} target_epoch=${target_epoch} resume_mode=${resume_mode} resume_path=${resume_path:-none} scheduler_start_epoch=${scheduler_start_epoch}"
 
   case "${stage}" in
     A_HOLD)
@@ -487,6 +544,7 @@ run_stage_chunk() {
       RUN_NAME="${run_name}" \
       NUM_EPOCHS="${target_epoch}" \
       LR_SCHEDULER_NUM_EPOCHS="${a_scheduler_epochs}" \
+      LR_SCHEDULER_START_EPOCH="${scheduler_start_epoch}" \
       TRAIN_LR="${a_train_lr}" \
       ROLLOUT_START_EPOCH="${FIRST_EVAL_EPOCH}" \
       ROLLOUT_EVERY="${ROLLOUT_EVERY}" \
@@ -497,7 +555,7 @@ run_stage_chunk() {
       GRIPPER_CLOSE_THRESHOLD="${GRIPPER_CLOSE_THRESHOLD:-auto}" \
       GRIPPER_CLOSE_IS_GREATER="${GRIPPER_CLOSE_IS_GREATER:-auto}" \
       N_TRAIN_ROLLOUTS="${A_N_TRAIN_ROLLOUTS:-10}" \
-      N_TRAIN_VIDEOS="${A_N_TRAIN_VIDEOS:-10}" \
+      N_TRAIN_VIDEOS="${A_N_TRAIN_VIDEOS:-3}" \
       N_TEST_ROLLOUTS="${A_N_TEST_ROLLOUTS:-50}" \
       N_TEST_VIDEOS="${A_N_TEST_VIDEOS:-10}" \
       N_ACTION_STEPS="${A_N_ACTION_STEPS:-4}" \
@@ -531,6 +589,7 @@ run_stage_chunk() {
       RUN_NAME="${run_name}" \
       NUM_EPOCHS="${target_epoch}" \
       LR_SCHEDULER_NUM_EPOCHS="${MAX_STAGE_EPOCHS}" \
+      LR_SCHEDULER_START_EPOCH="${scheduler_start_epoch}" \
       ROLLOUT_START_EPOCH="${FIRST_EVAL_EPOCH}" \
       ROLLOUT_EVERY="${ROLLOUT_EVERY}" \
       CHECKPOINT_EVERY="${CHECKPOINT_EVERY}" \
@@ -578,6 +637,7 @@ run_stage_chunk() {
       RUN_NAME="${run_name}" \
       NUM_EPOCHS="${target_epoch}" \
       LR_SCHEDULER_NUM_EPOCHS="${MAX_STAGE_EPOCHS}" \
+      LR_SCHEDULER_START_EPOCH="${scheduler_start_epoch}" \
       ROLLOUT_START_EPOCH="${FIRST_EVAL_EPOCH}" \
       ROLLOUT_EVERY="${ROLLOUT_EVERY}" \
       CHECKPOINT_EVERY="${CHECKPOINT_EVERY}" \
@@ -639,6 +699,7 @@ run_until_pass() {
   local a_finetune_active=false
   local best_epoch=-1
   local plateau_evals=0
+  local scheduler_start_epoch=0
 
   run_name="$(stage_run_name "${stage}")"
   threshold="$(stage_pass_score "${stage}")"
@@ -656,17 +717,20 @@ run_until_pass() {
         run_name="${a_finetune_run}"
         minimum_epoch="${source_epoch}"
         maximum_epoch=$((source_epoch + A_FINETUNE_EPOCHS + 1))
+        scheduler_start_epoch="${source_epoch}"
         a_finetune_active=true
         echo "[AUTO] resuming A plateau recovery from source_epoch=${source_epoch}, max_epoch=${maximum_epoch}"
       fi
       ;;
     B_INSERT)
       source_epoch="$(checkpoint_epoch "${init_resume_path}")"
+      scheduler_start_epoch="${source_epoch}"
       minimum_epoch=$((source_epoch + B_PASS_ADDED_EPOCHS))
       maximum_epoch=$((source_epoch + MAX_STAGE_EPOCHS + 1))
       ;;
     C_FULL)
       source_epoch="$(checkpoint_epoch "${init_resume_path}")"
+      scheduler_start_epoch="${source_epoch}"
       minimum_epoch=$((source_epoch + C_MIN_ADDED_EPOCHS))
       maximum_epoch=$((source_epoch + MAX_STAGE_EPOCHS + 1))
       ;;
@@ -701,6 +765,7 @@ run_until_pass() {
           run_name="${a_finetune_run}"
           minimum_epoch="${source_epoch}"
           maximum_epoch=$((source_epoch + A_FINETUNE_EPOCHS + 1))
+          scheduler_start_epoch="${source_epoch}"
           a_finetune_active=true
           continue
         fi
@@ -756,7 +821,9 @@ run_until_pass() {
       target="${maximum_epoch}"
     fi
 
-    run_stage_chunk "${stage}" "${run_name}" "${target}" "${resume_mode}" "${resume_path}"
+    run_stage_chunk \
+      "${stage}" "${run_name}" "${target}" "${resume_mode}" "${resume_path}" \
+      "${scheduler_start_epoch}"
 
     score="$(latest_score "${run_name}" "${metric}")"
     cur="$(current_epoch "${run_name}")"
@@ -828,6 +895,7 @@ run_until_pass() {
 }
 
 require_project_root
+acquire_training_lock
 resolve_base_run_name
 
 if [[ -n "${A_CHECKPOINT_PATH}" ]]; then
