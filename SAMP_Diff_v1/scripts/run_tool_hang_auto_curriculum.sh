@@ -38,10 +38,14 @@ B_PASS_SCORE="${B_PASS_SCORE:-0.50}"
 C_PASS_SCORE="${C_PASS_SCORE:-0.50}"
 B_PASS_ADDED_EPOCHS="${B_PASS_ADDED_EPOCHS:-2000}"
 B_FREEZE_ENCODER_ADDED_EPOCHS="${B_FREEZE_ENCODER_ADDED_EPOCHS:-300}"
-A_REQUIRED_CONSECUTIVE_PASSES="${A_REQUIRED_CONSECUTIVE_PASSES:-1}"
+A_REQUIRED_CONSECUTIVE_PASSES="${A_REQUIRED_CONSECUTIVE_PASSES:-2}"
 B_REQUIRED_CONSECUTIVE_PASSES="${B_REQUIRED_CONSECUTIVE_PASSES:-2}"
 C_REQUIRED_CONSECUTIVE_PASSES="${C_REQUIRED_CONSECUTIVE_PASSES:-2}"
 ROLLING_BEST_CHECKPOINT="${ROLLING_BEST_CHECKPOINT:-true}"
+A_PLATEAU_START_EPOCH="${A_PLATEAU_START_EPOCH:-1200}"
+A_PLATEAU_PATIENCE_EPOCHS="${A_PLATEAU_PATIENCE_EPOCHS:-400}"
+A_FINETUNE_EPOCHS="${A_FINETUNE_EPOCHS:-800}"
+A_FINETUNE_LR="${A_FINETUNE_LR:-0.00002}"
 A_MIN_EPOCH="${A_MIN_EPOCH:-300}"
 A_DIRECTION_CHECK_EPOCH="${A_DIRECTION_CHECK_EPOCH:-1200}"
 A_MIN_CONTACT_RATE="${A_MIN_CONTACT_RATE:-0.02}"
@@ -273,12 +277,16 @@ record_best_checkpoint() {
     return
   fi
 
-  source_ckpt="$(latest_ckpt "${run_name}")"
+  checkpoint_dir="data/outputs/robomimic/${run_name}/checkpoints"
+  source_ckpt="$(find "${checkpoint_dir}" -maxdepth 1 -type f \
+    -name "epoch=${metric_epoch}_*.ckpt" -print -quit 2>/dev/null || true)"
+  if [[ -z "${source_ckpt}" ]]; then
+    source_ckpt="$(latest_ckpt "${run_name}")"
+  fi
   if [[ -z "${source_ckpt}" ]]; then
     return
   fi
 
-  checkpoint_dir="data/outputs/robomimic/${run_name}/checkpoints"
   best_ckpt="${checkpoint_dir}/auto_best_${stage}.ckpt"
   state_path="${checkpoint_dir}/auto_best_${stage}.txt"
   improved="$(python -c "import math, pathlib
@@ -300,6 +308,71 @@ print('yes' if score > best else 'no')")"
   if [[ -f "${best_ckpt}" ]]; then
     BEST_CKPT="${best_ckpt}"
   fi
+}
+
+restore_historical_best_checkpoint() {
+  local stage="$1"
+  local run_name="$2"
+  local metric="$3"
+  local log_path="data/outputs/robomimic/${run_name}/logs.json.txt"
+  local checkpoint_dir="data/outputs/robomimic/${run_name}/checkpoints"
+  local best_ckpt="${checkpoint_dir}/auto_best_${stage}.ckpt"
+  local state_path="${checkpoint_dir}/auto_best_${stage}.txt"
+  local result
+  local score
+  local metric_epoch
+  local source_ckpt
+
+  BEST_CKPT=""
+  if [[ "${ROLLING_BEST_CHECKPOINT}" != "true" || ! -f "${log_path}" ]]; then
+    return
+  fi
+
+  result="$(python -c "import json, math, pathlib
+p=pathlib.Path('${log_path}')
+metric='${metric}'
+best_score=-math.inf
+best_epoch=-1
+for line in p.read_text(errors='ignore').splitlines():
+    try:
+        obj=json.loads(line)
+        score=float(obj[metric])
+        epoch=int(obj['epoch'])
+    except Exception:
+        continue
+    if not math.isnan(score) and score > best_score:
+        best_score=score
+        best_epoch=epoch
+print('nan -1' if best_epoch < 0 else f'{best_score} {best_epoch}')")"
+  read -r score metric_epoch <<< "${result}"
+  if [[ "${score}" == "nan" || "${metric_epoch}" -lt 0 ]]; then
+    return
+  fi
+
+  source_ckpt="$(find "${checkpoint_dir}" -maxdepth 1 -type f \
+    -name "epoch=${metric_epoch}_*.ckpt" -print -quit 2>/dev/null || true)"
+  if [[ -z "${source_ckpt}" ]]; then
+    if [[ -f "${best_ckpt}" && -f "${state_path}" ]]; then
+      BEST_CKPT="${best_ckpt}"
+    fi
+    return
+  fi
+
+  cp -f "${source_ckpt}" "${best_ckpt}"
+  printf '%s %s %s\n' "${score}" "${metric_epoch}" "${metric}" > "${state_path}"
+  BEST_CKPT="${best_ckpt}"
+  echo "[AUTO] ${stage} historical best restored: ${metric}=${score}, metric_epoch=${metric_epoch}, checkpoint=${best_ckpt}"
+}
+
+best_checkpoint_epoch() {
+  local run_name="$1"
+  local stage="$2"
+  local state_path="data/outputs/robomimic/${run_name}/checkpoints/auto_best_${stage}.txt"
+  if [[ ! -f "${state_path}" ]]; then
+    echo -1
+    return
+  fi
+  awk '{print $2}' "${state_path}"
 }
 
 score_passed() {
@@ -342,9 +415,18 @@ run_stage_chunk() {
       # Exact A recipe from the original direction_guard_v4 run that reached
       # stage_grasp_rate >= 0.80. B/C changes must stay in their own cases.
       echo "[AUTO] A recipe=direction_guard_v4_exact phase_loss=false timing=false weights=1.2/1.2/1.6 prefix=64/96/160 variant=HG"
+      if [[ "${run_name}" == "${BASE_RUN_NAME}_A_hold_finetune" ]]; then
+        a_train_lr="${A_FINETUNE_LR}"
+        a_scheduler_epochs="$((A_FINETUNE_EPOCHS + 1))"
+        echo "[AUTO] A plateau recovery active: lr=${a_train_lr}, scheduler_epochs=${a_scheduler_epochs}"
+      else
+        a_train_lr="${A_TRAIN_LR:-0.0001}"
+        a_scheduler_epochs="$((A_MAX_EPOCHS + 1))"
+      fi
       RUN_NAME="${run_name}" \
       NUM_EPOCHS="${target_epoch}" \
-      LR_SCHEDULER_NUM_EPOCHS="$((A_MAX_EPOCHS + 1))" \
+      LR_SCHEDULER_NUM_EPOCHS="${a_scheduler_epochs}" \
+      TRAIN_LR="${a_train_lr}" \
       ROLLOUT_START_EPOCH="${FIRST_EVAL_EPOCH}" \
       ROLLOUT_EVERY="${ROLLOUT_EVERY}" \
       CHECKPOINT_EVERY="${CHECKPOINT_EVERY}" \
@@ -355,8 +437,8 @@ run_stage_chunk() {
       GRIPPER_CLOSE_IS_GREATER="${GRIPPER_CLOSE_IS_GREATER:-auto}" \
       N_TRAIN_ROLLOUTS="${A_N_TRAIN_ROLLOUTS:-10}" \
       N_TRAIN_VIDEOS="${A_N_TRAIN_VIDEOS:-10}" \
-      N_TEST_ROLLOUTS="${A_N_TEST_ROLLOUTS:-20}" \
-      N_TEST_VIDEOS="${A_N_TEST_VIDEOS:-20}" \
+      N_TEST_ROLLOUTS="${A_N_TEST_ROLLOUTS:-50}" \
+      N_TEST_VIDEOS="${A_N_TEST_VIDEOS:-10}" \
       N_ACTION_STEPS="${A_N_ACTION_STEPS:-4}" \
       HISTORY_SHIFT="${A_HISTORY_SHIFT:-4}" \
       ACTION_CLIP_BY_DATASET=true \
@@ -491,6 +573,11 @@ run_until_pass() {
   local pass_count=0
   local required_passes=0
   local BEST_CKPT=""
+  local a_finetune_run="${BASE_RUN_NAME}_A_hold_finetune"
+  local a_finetune_state="data/outputs/robomimic/${BASE_RUN_NAME}_A_hold_finetune/.auto_finetune_source"
+  local a_finetune_active=false
+  local best_epoch=-1
+  local plateau_age=0
 
   run_name="$(stage_run_name "${stage}")"
   threshold="$(stage_pass_score "${stage}")"
@@ -503,6 +590,14 @@ run_until_pass() {
       # num_epochs is exclusive; +1 ensures the final budget epoch itself
       # performs rollout (for example epoch 3000 with A_MAX_EPOCHS=3000).
       maximum_epoch=$((A_MAX_EPOCHS + 1))
+      if [[ -f "${a_finetune_state}" ]]; then
+        read -r source_epoch init_resume_path < "${a_finetune_state}"
+        run_name="${a_finetune_run}"
+        minimum_epoch="${source_epoch}"
+        maximum_epoch=$((source_epoch + A_FINETUNE_EPOCHS + 1))
+        a_finetune_active=true
+        echo "[AUTO] resuming A plateau recovery from source_epoch=${source_epoch}, max_epoch=${maximum_epoch}"
+      fi
       ;;
     B_INSERT)
       source_epoch="$(checkpoint_epoch "${init_resume_path}")"
@@ -526,6 +621,30 @@ run_until_pass() {
     ckpt="$(latest_ckpt "${run_name}")"
     metric_epoch="$(latest_metric_epoch "${run_name}" "${metric}")"
     record_best_checkpoint "${stage}" "${run_name}" "${metric}" "${score}" "${metric_epoch}"
+    if [[ "${stage}" == "A_HOLD" && "${a_finetune_active}" != "true" ]]; then
+      restore_historical_best_checkpoint "${stage}" "${run_name}" "${metric}"
+      best_epoch="$(best_checkpoint_epoch "${run_name}" "${stage}")"
+      if [[ "${metric_epoch}" -ge "${A_PLATEAU_START_EPOCH}" && "${best_epoch}" -ge 0 ]]; then
+        plateau_age=$((metric_epoch - best_epoch))
+        if [[ "${plateau_age}" -ge "${A_PLATEAU_PATIENCE_EPOCHS}" ]]; then
+          if [[ -z "${BEST_CKPT}" || ! -f "${BEST_CKPT}" ]]; then
+            echo "[ERROR] A plateau detected but historical best checkpoint is missing." >&2
+            exit 8
+          fi
+          source_epoch="$(checkpoint_epoch "${BEST_CKPT}")"
+          mkdir -p "data/outputs/robomimic/${a_finetune_run}"
+          printf '%s %s\n' "${source_epoch}" "${BEST_CKPT}" > "${a_finetune_state}"
+          echo "[AUTO] A plateau detected: no improvement for ${plateau_age} epochs."
+          echo "[AUTO] Rolling back to ${BEST_CKPT} and starting ${a_finetune_run} with lr=${A_FINETUNE_LR}."
+          init_resume_path="${BEST_CKPT}"
+          run_name="${a_finetune_run}"
+          minimum_epoch="${source_epoch}"
+          maximum_epoch=$((source_epoch + A_FINETUNE_EPOCHS + 1))
+          a_finetune_active=true
+          continue
+        fi
+      fi
+    fi
     if [[ "${passed}" == "yes" && "${cur}" -ge "${minimum_epoch}" && "${pass_count}" -ge "${required_passes}" && -n "${ckpt}" ]]; then
       echo "[AUTO] ${stage} gate was already passed: ${metric}=${score}, epoch=${cur}, consecutive=${pass_count}."
       PASSED_CKPT="${BEST_CKPT:-${ckpt}}"
