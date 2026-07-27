@@ -23,8 +23,8 @@ set -euo pipefail
 #   A_PASS_SCORE=0.80 B_PASS_SCORE=0.50 C_PASS_SCORE=0.50 bash scripts/run_tool_hang_auto_curriculum.sh
 #   MAX_STAGE_EPOCHS=3000 CHUNK_EPOCHS=200 bash scripts/run_tool_hang_auto_curriculum.sh
 
-PIPELINE_VERSION="toolhang_direction_guard_v6_continuous"
-BASE_RUN_NAME="${BASE_RUN_NAME:-tool_hang_auto_direction_guard_v6_continuous}"
+PIPELINE_VERSION="toolhang_direction_guard_v7_adaptive"
+BASE_RUN_NAME="${BASE_RUN_NAME:-}"
 CHUNK_EPOCHS="${CHUNK_EPOCHS:-50}"
 FIRST_EVAL_EPOCH="${FIRST_EVAL_EPOCH:-300}"
 ROLLOUT_EVERY="${ROLLOUT_EVERY:-50}"
@@ -43,9 +43,13 @@ B_REQUIRED_CONSECUTIVE_PASSES="${B_REQUIRED_CONSECUTIVE_PASSES:-2}"
 C_REQUIRED_CONSECUTIVE_PASSES="${C_REQUIRED_CONSECUTIVE_PASSES:-2}"
 ROLLING_BEST_CHECKPOINT="${ROLLING_BEST_CHECKPOINT:-true}"
 A_PLATEAU_START_EPOCH="${A_PLATEAU_START_EPOCH:-1200}"
-A_PLATEAU_PATIENCE_EPOCHS="${A_PLATEAU_PATIENCE_EPOCHS:-400}"
-A_FINETUNE_EPOCHS="${A_FINETUNE_EPOCHS:-800}"
-A_FINETUNE_LR="${A_FINETUNE_LR:-0.00002}"
+A_PLATEAU_PATIENCE_EVALS="${A_PLATEAU_PATIENCE_EVALS:-8}"
+A_FINETUNE_EVALS="${A_FINETUNE_EVALS:-16}"
+A_BASE_LR="${A_BASE_LR:-0.0001}"
+A_LR_DECAY_FACTOR="${A_LR_DECAY_FACTOR:-0.25}"
+A_MIN_FINETUNE_LR="${A_MIN_FINETUNE_LR:-0.000005}"
+A_FINETUNE_EPOCHS="${A_FINETUNE_EPOCHS:-$((ROLLOUT_EVERY * A_FINETUNE_EVALS))}"
+A_FINETUNE_LR="${A_FINETUNE_LR:-$(python -c "print(max(float('${A_BASE_LR}') * float('${A_LR_DECAY_FACTOR}'), float('${A_MIN_FINETUNE_LR}')))")}"
 A_MIN_EPOCH="${A_MIN_EPOCH:-300}"
 A_DIRECTION_CHECK_EPOCH="${A_DIRECTION_CHECK_EPOCH:-1200}"
 A_MIN_CONTACT_RATE="${A_MIN_CONTACT_RATE:-0.02}"
@@ -57,6 +61,8 @@ C_MIN_ADDED_EPOCHS="${C_MIN_ADDED_EPOCHS:-500}"
 ALLOW_STAGE_B="${ALLOW_STAGE_B:-true}"
 ALLOW_STAGE_C="${ALLOW_STAGE_C:-true}"
 A_CHECKPOINT_PATH="${A_CHECKPOINT_PATH:-}"
+AUTO_RESUME_LATEST="${AUTO_RESUME_LATEST:-true}"
+ACTIVE_RUN_FILE="${ACTIVE_RUN_FILE:-data/outputs/robomimic/.tool_hang_active_run}"
 
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
@@ -67,6 +73,32 @@ export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
+
+resolve_base_run_name() {
+  local latest_run=""
+  if [[ -n "${BASE_RUN_NAME}" ]]; then
+    :
+  elif [[ -f "${ACTIVE_RUN_FILE}" ]]; then
+    BASE_RUN_NAME="$(tr -d '\r\n' < "${ACTIVE_RUN_FILE}")"
+    echo "[AUTO] active run restored from ${ACTIVE_RUN_FILE}: ${BASE_RUN_NAME}"
+  elif [[ "${AUTO_RESUME_LATEST}" == "true" && -d "data/outputs/robomimic" ]]; then
+    latest_run="$(find data/outputs/robomimic -maxdepth 1 -mindepth 1 -type d \
+      -name '*_A_hold' -printf '%T@ %f\n' 2>/dev/null \
+      | sort -n | tail -1 | cut -d' ' -f2-)"
+    if [[ -n "${latest_run}" ]]; then
+      BASE_RUN_NAME="${latest_run%_A_hold}"
+      echo "[AUTO] latest A run detected: ${BASE_RUN_NAME}"
+    fi
+  fi
+
+  if [[ -z "${BASE_RUN_NAME}" ]]; then
+    BASE_RUN_NAME="tool_hang_auto_adaptive_$(date +%Y%m%d_%H%M%S)"
+    echo "[AUTO] no resumable run found; creating ${BASE_RUN_NAME}"
+  fi
+
+  mkdir -p "$(dirname "${ACTIVE_RUN_FILE}")"
+  printf '%s\n' "${BASE_RUN_NAME}" > "${ACTIVE_RUN_FILE}"
+}
 
 require_project_root() {
   if [[ ! -f train.py || ! -f scripts/run_tool_hang_rescue.sh ]]; then
@@ -375,6 +407,35 @@ best_checkpoint_epoch() {
   awk '{print $2}' "${state_path}"
 }
 
+evaluations_since_best() {
+  local run_name="$1"
+  local metric="$2"
+  local log_path="data/outputs/robomimic/${run_name}/logs.json.txt"
+  if [[ ! -f "${log_path}" ]]; then
+    echo 0
+    return
+  fi
+  python -c "import json, math, pathlib
+p=pathlib.Path('${log_path}')
+metric='${metric}'
+by_epoch={}
+for line in p.read_text(errors='ignore').splitlines():
+    try:
+        obj=json.loads(line)
+        value=float(obj[metric])
+        epoch=int(obj['epoch'])
+    except Exception:
+        continue
+    if not math.isnan(value):
+        by_epoch[epoch]=value
+items=sorted(by_epoch.items())
+if not items:
+    print(0)
+else:
+    best_index=max(range(len(items)), key=lambda i: items[i][1])
+    print(len(items) - best_index - 1)"
+}
+
 score_passed() {
   local score="$1"
   local threshold="$2"
@@ -420,7 +481,7 @@ run_stage_chunk() {
         a_scheduler_epochs="$((A_FINETUNE_EPOCHS + 1))"
         echo "[AUTO] A plateau recovery active: lr=${a_train_lr}, scheduler_epochs=${a_scheduler_epochs}"
       else
-        a_train_lr="${A_TRAIN_LR:-0.0001}"
+        a_train_lr="${A_TRAIN_LR:-${A_BASE_LR}}"
         a_scheduler_epochs="$((A_MAX_EPOCHS + 1))"
       fi
       RUN_NAME="${run_name}" \
@@ -577,7 +638,7 @@ run_until_pass() {
   local a_finetune_state="data/outputs/robomimic/${BASE_RUN_NAME}_A_hold_finetune/.auto_finetune_source"
   local a_finetune_active=false
   local best_epoch=-1
-  local plateau_age=0
+  local plateau_evals=0
 
   run_name="$(stage_run_name "${stage}")"
   threshold="$(stage_pass_score "${stage}")"
@@ -625,8 +686,8 @@ run_until_pass() {
       restore_historical_best_checkpoint "${stage}" "${run_name}" "${metric}"
       best_epoch="$(best_checkpoint_epoch "${run_name}" "${stage}")"
       if [[ "${metric_epoch}" -ge "${A_PLATEAU_START_EPOCH}" && "${best_epoch}" -ge 0 ]]; then
-        plateau_age=$((metric_epoch - best_epoch))
-        if [[ "${plateau_age}" -ge "${A_PLATEAU_PATIENCE_EPOCHS}" ]]; then
+        plateau_evals="$(evaluations_since_best "${run_name}" "${metric}")"
+        if [[ "${plateau_evals}" -ge "${A_PLATEAU_PATIENCE_EVALS}" ]]; then
           if [[ -z "${BEST_CKPT}" || ! -f "${BEST_CKPT}" ]]; then
             echo "[ERROR] A plateau detected but historical best checkpoint is missing." >&2
             exit 8
@@ -634,7 +695,7 @@ run_until_pass() {
           source_epoch="$(checkpoint_epoch "${BEST_CKPT}")"
           mkdir -p "data/outputs/robomimic/${a_finetune_run}"
           printf '%s %s\n' "${source_epoch}" "${BEST_CKPT}" > "${a_finetune_state}"
-          echo "[AUTO] A plateau detected: no improvement for ${plateau_age} epochs."
+          echo "[AUTO] A plateau detected: no improvement for ${plateau_evals} evaluations."
           echo "[AUTO] Rolling back to ${BEST_CKPT} and starting ${a_finetune_run} with lr=${A_FINETUNE_LR}."
           init_resume_path="${BEST_CKPT}"
           run_name="${a_finetune_run}"
@@ -767,6 +828,7 @@ run_until_pass() {
 }
 
 require_project_root
+resolve_base_run_name
 
 if [[ -n "${A_CHECKPOINT_PATH}" ]]; then
   if [[ ! -f "${A_CHECKPOINT_PATH}" ]]; then
