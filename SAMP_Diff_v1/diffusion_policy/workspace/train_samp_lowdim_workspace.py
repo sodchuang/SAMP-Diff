@@ -132,6 +132,14 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
                     exclude_keys=('optimizer',),
                     include_keys=('epoch',),
                 )
+                # The stage gate evaluates ema_model. Promote exactly those
+                # validated weights into the train model for the next stage.
+                if self.ema_model is not None:
+                    self.model.load_state_dict(self.ema_model.state_dict())
+                    print(
+                        "[Transfer] initialized train model from validated "
+                        "EMA checkpoint weights"
+                    )
         elif cfg.training.resume:
             lastest_ckpt_path = self.get_checkpoint_path()
             if lastest_ckpt_path.is_file():
@@ -166,12 +174,24 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
             self.ema_model.set_normalizer(normalizer)
 
         # configure lr scheduler
+        scheduler_num_epochs = int(
+            cfg.training.get('lr_scheduler_num_epochs', cfg.training.num_epochs)
+        )
+        if scheduler_num_epochs <= 0:
+            raise ValueError(
+                "training.lr_scheduler_num_epochs must be positive"
+            )
+        print(
+            "[Training] fixed LR scheduler horizon: "
+            f"{scheduler_num_epochs} epochs "
+            f"(this process stops at {cfg.training.num_epochs})"
+        )
         lr_scheduler = get_scheduler(
             cfg.training.lr_scheduler,
             optimizer=self.optimizer,
             num_warmup_steps=cfg.training.lr_warmup_steps,
             num_training_steps=(
-                len(train_dataloader) * cfg.training.num_epochs
+                len(train_dataloader) * scheduler_num_epochs
             ) // cfg.training.gradient_accumulate_every,
             last_epoch=self.global_step - 1,
         )
@@ -180,6 +200,13 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
         ema: EMAModel = None
         if cfg.training.use_ema:
             ema = hydra.utils.instantiate(cfg.ema, model=self.ema_model)
+            ema.optimization_step = max(0, int(self.global_step))
+            ema.decay = ema.get_decay(ema.optimization_step)
+            print(
+                "[Training] restored EMA schedule at "
+                f"optimization_step={ema.optimization_step}, "
+                f"decay={ema.decay:.6f}"
+            )
 
         # configure env runner only when rollout is enabled. This allows
         # dataset-only training on systems without mujoco_py / robosuite.

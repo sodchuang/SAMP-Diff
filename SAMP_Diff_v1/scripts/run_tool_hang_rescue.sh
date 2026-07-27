@@ -274,6 +274,7 @@ python train.py --config-name=tool_hang_ph \
   "training.resume=${TRAINING_RESUME:-false}" \
   "++training.resume_from_path=${RESUME_FROM_PATH:-null}" \
   "training.num_epochs=${num_epochs}" \
+  "++training.lr_scheduler_num_epochs=${LR_SCHEDULER_NUM_EPOCHS:-${num_epochs}}" \
   "training.rollout_every=${rollout_every}" \
   "++training.rollout_start_epoch=${rollout_start_epoch:-0}" \
   "++training.rollout_before_training=${ROLLOUT_BEFORE_TRAINING:-false}" \
