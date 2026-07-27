@@ -333,7 +333,6 @@ run_stage_chunk() {
   local target_epoch="$3"
   local resume_mode="$4"
   local resume_path="${5:-}"
-  local scheduler_num_epochs="$6"
 
   echo
   echo "[AUTO] stage=${stage} run=${run_name} target_epoch=${target_epoch} resume_mode=${resume_mode} resume_path=${resume_path:-none}"
@@ -345,7 +344,7 @@ run_stage_chunk() {
       echo "[AUTO] A recipe=direction_guard_v4_exact phase_loss=false timing=false weights=1.2/1.2/1.6 prefix=64/96/160 variant=HG"
       RUN_NAME="${run_name}" \
       NUM_EPOCHS="${target_epoch}" \
-      LR_SCHEDULER_NUM_EPOCHS="${scheduler_num_epochs}" \
+      LR_SCHEDULER_NUM_EPOCHS="$((A_MAX_EPOCHS + 1))" \
       ROLLOUT_START_EPOCH="${FIRST_EVAL_EPOCH}" \
       ROLLOUT_EVERY="${ROLLOUT_EVERY}" \
       CHECKPOINT_EVERY="${CHECKPOINT_EVERY}" \
@@ -388,7 +387,7 @@ run_stage_chunk() {
       echo "[AUTO] B recipe=insert_only_v5 lr=1e-5 action_steps=4 release=false metric=stage_insert_rate"
       RUN_NAME="${run_name}" \
       NUM_EPOCHS="${target_epoch}" \
-      LR_SCHEDULER_NUM_EPOCHS="${scheduler_num_epochs}" \
+      LR_SCHEDULER_NUM_EPOCHS="${MAX_STAGE_EPOCHS}" \
       ROLLOUT_START_EPOCH="${FIRST_EVAL_EPOCH}" \
       ROLLOUT_EVERY="${ROLLOUT_EVERY}" \
       CHECKPOINT_EVERY="${CHECKPOINT_EVERY}" \
@@ -435,7 +434,7 @@ run_stage_chunk() {
     C_FULL)
       RUN_NAME="${run_name}" \
       NUM_EPOCHS="${target_epoch}" \
-      LR_SCHEDULER_NUM_EPOCHS="${scheduler_num_epochs}" \
+      LR_SCHEDULER_NUM_EPOCHS="${MAX_STAGE_EPOCHS}" \
       ROLLOUT_START_EPOCH="${FIRST_EVAL_EPOCH}" \
       ROLLOUT_EVERY="${ROLLOUT_EVERY}" \
       CHECKPOINT_EVERY="${CHECKPOINT_EVERY}" \
@@ -577,7 +576,7 @@ run_until_pass() {
       target="${maximum_epoch}"
     fi
 
-    run_stage_chunk "${stage}" "${run_name}" "${target}" "${resume_mode}" "${resume_path}" "${maximum_epoch}"
+    run_stage_chunk "${stage}" "${run_name}" "${target}" "${resume_mode}" "${resume_path}"
 
     score="$(latest_score "${run_name}" "${metric}")"
     cur="$(current_epoch "${run_name}")"
