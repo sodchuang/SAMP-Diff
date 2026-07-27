@@ -23,8 +23,8 @@ set -euo pipefail
 #   A_PASS_SCORE=0.80 B_PASS_SCORE=0.50 C_PASS_SCORE=0.50 bash scripts/run_tool_hang_auto_curriculum.sh
 #   MAX_STAGE_EPOCHS=3000 CHUNK_EPOCHS=200 bash scripts/run_tool_hang_auto_curriculum.sh
 
-PIPELINE_VERSION="toolhang_direction_guard_v4"
-BASE_RUN_NAME="${BASE_RUN_NAME:-tool_hang_auto_direction_guard_v4}"
+PIPELINE_VERSION="toolhang_direction_guard_v5_rolling"
+BASE_RUN_NAME="${BASE_RUN_NAME:-tool_hang_auto_direction_guard_v5_rolling}"
 CHUNK_EPOCHS="${CHUNK_EPOCHS:-200}"
 FIRST_EVAL_EPOCH="${FIRST_EVAL_EPOCH:-300}"
 ROLLOUT_EVERY="${ROLLOUT_EVERY:-100}"
@@ -39,6 +39,7 @@ C_PASS_SCORE="${C_PASS_SCORE:-0.50}"
 B_PASS_ADDED_EPOCHS="${B_PASS_ADDED_EPOCHS:-2000}"
 B_FREEZE_ENCODER_ADDED_EPOCHS="${B_FREEZE_ENCODER_ADDED_EPOCHS:-300}"
 REQUIRED_CONSECUTIVE_PASSES="${REQUIRED_CONSECUTIVE_PASSES:-2}"
+ROLLING_BEST_CHECKPOINT="${ROLLING_BEST_CHECKPOINT:-true}"
 A_MIN_EPOCH="${A_MIN_EPOCH:-300}"
 A_DIRECTION_CHECK_EPOCH="${A_DIRECTION_CHECK_EPOCH:-1200}"
 A_MIN_CONTACT_RATE="${A_MIN_CONTACT_RATE:-0.02}"
@@ -224,20 +225,69 @@ consecutive_passes() {
 p=pathlib.Path('${log_path}')
 metric='${metric}'
 threshold=float('${threshold}')
-values=[]
+values_by_epoch={}
 for line in p.read_text(errors='ignore').splitlines():
     try:
         obj=json.loads(line)
     except Exception:
         continue
-    if metric in obj:
-        values.append(float(obj[metric]))
+    if metric in obj and 'epoch' in obj:
+        # A resume-time rollout can log the same epoch more than once. Count
+        # distinct rollout epochs so one duplicated result cannot satisfy the
+        # consecutive-pass gate by itself.
+        values_by_epoch[int(obj['epoch'])]=float(obj[metric])
 count=0
-for value in reversed(values):
+for _, value in sorted(values_by_epoch.items(), reverse=True):
     if value < threshold:
         break
     count += 1
 print(count)"
+}
+
+record_best_checkpoint() {
+  local stage="$1"
+  local run_name="$2"
+  local metric="$3"
+  local score="$4"
+  local metric_epoch="$5"
+  local source_ckpt
+  local checkpoint_dir
+  local best_ckpt
+  local state_path
+  local improved
+
+  BEST_CKPT=""
+  if [[ "${ROLLING_BEST_CHECKPOINT}" != "true" || "${score}" == "nan" ]]; then
+    return
+  fi
+
+  source_ckpt="$(latest_ckpt "${run_name}")"
+  if [[ -z "${source_ckpt}" ]]; then
+    return
+  fi
+
+  checkpoint_dir="data/outputs/robomimic/${run_name}/checkpoints"
+  best_ckpt="${checkpoint_dir}/auto_best_${stage}.ckpt"
+  state_path="${checkpoint_dir}/auto_best_${stage}.txt"
+  improved="$(python -c "import math, pathlib
+score=float('${score}')
+p=pathlib.Path('${state_path}')
+best=-math.inf
+if p.is_file():
+    try:
+        best=float(p.read_text().split()[0])
+    except Exception:
+        pass
+print('yes' if score > best else 'no')")"
+
+  if [[ "${improved}" == "yes" ]]; then
+    cp -f "${source_ckpt}" "${best_ckpt}"
+    printf '%s %s %s\n' "${score}" "${metric_epoch}" "${metric}" > "${state_path}"
+    echo "[AUTO] ${stage} rolling best updated: ${metric}=${score}, metric_epoch=${metric_epoch}, checkpoint=${best_ckpt}"
+  fi
+  if [[ -f "${best_ckpt}" ]]; then
+    BEST_CKPT="${best_ckpt}"
+  fi
 }
 
 score_passed() {
@@ -277,9 +327,9 @@ run_stage_chunk() {
 
   case "${stage}" in
     A_HOLD)
-      # Use the actual HG grasp recipe. The previous auto-stage accidentally
-      # disabled HG's phase loss, close latch and pick window while claiming to
-      # restore it; rollout grasp rate consequently plateaued around 0.4-0.55.
+      # Exact A recipe from the original direction_guard_v4 run that reached
+      # stage_grasp_rate >= 0.80. B/C changes must stay in their own cases.
+      echo "[AUTO] A recipe=direction_guard_v4_exact phase_loss=false timing=false weights=1.2/1.2/1.6 prefix=64/96/160 variant=HG"
       RUN_NAME="${run_name}" \
       NUM_EPOCHS="${target_epoch}" \
       ROLLOUT_START_EPOCH="${FIRST_EVAL_EPOCH}" \
@@ -299,25 +349,18 @@ run_stage_chunk() {
       ACTION_CLIP_BY_DATASET=true \
       ACTION_CLIP_MARGIN_SCALE="${A_ACTION_CLIP_MARGIN_SCALE:-0.10}" \
       ACTION_CLIP_MIN_MARGIN="${A_ACTION_CLIP_MIN_MARGIN:-0.02}" \
-      PHASE_LOSS_ENABLED=true \
-      PHASE_LOSS_WEIGHT="${A_PHASE_LOSS_WEIGHT:-0.013}" \
-      TRANSLATION_WEIGHT="${A_TRANSLATION_WEIGHT:-2.7}" \
-      ROTATION_WEIGHT="${A_ROTATION_WEIGHT:-0.30}" \
-      GRIPPER_WEIGHT="${A_GRIPPER_WEIGHT:-4.6}" \
-      ROTATION_SIGMA="${A_ROTATION_SIGMA:-0.07}" \
-      GRIPPER_TIMING_ENABLED=true \
-      MIN_CLOSE_STEPS="${A_MIN_CLOSE_STEPS:-12}" \
-      MAX_LATCH_CHUNKS_AFTER_CLOSE="${A_MAX_LATCH_CHUNKS_AFTER_CLOSE:-24}" \
-      PICK_WINDOW_BEFORE="${A_PICK_WINDOW_BEFORE:-8}" \
-      PICK_WINDOW_AFTER="${A_PICK_WINDOW_AFTER:-24}" \
-      PICK_WINDOW_TRANSLATION_WEIGHT="${A_PICK_WINDOW_TRANSLATION_WEIGHT:-3.6}" \
-      PICK_WINDOW_ROTATION_WEIGHT="${A_PICK_WINDOW_ROTATION_WEIGHT:-0.25}" \
-      PICK_WINDOW_GRIPPER_WEIGHT="${A_PICK_WINDOW_GRIPPER_WEIGHT:-5.2}" \
+      PHASE_LOSS_ENABLED=false \
+      PHASE_LOSS_WEIGHT="${A_PHASE_LOSS_WEIGHT:-0.004}" \
+      TRANSLATION_WEIGHT="${A_TRANSLATION_WEIGHT:-1.2}" \
+      ROTATION_WEIGHT="${A_ROTATION_WEIGHT:-1.2}" \
+      GRIPPER_WEIGHT="${A_GRIPPER_WEIGHT:-1.6}" \
+      ROTATION_SIGMA="${A_ROTATION_SIGMA:-0.12}" \
+      GRIPPER_TIMING_ENABLED=false \
       EPISODE_PREFIX_ENABLED=true \
       EPISODE_PREFIX_ANCHOR=first_close \
-      EPISODE_PREFIX_AFTER="${A_EPISODE_PREFIX_AFTER:-80}" \
-      EPISODE_PREFIX_MIN_STEPS="${A_EPISODE_PREFIX_MIN_STEPS:-110}" \
-      EPISODE_PREFIX_MAX_STEPS="${A_EPISODE_PREFIX_MAX_STEPS:-200}" \
+      EPISODE_PREFIX_AFTER="${A_EPISODE_PREFIX_AFTER:-64}" \
+      EPISODE_PREFIX_MIN_STEPS="${A_EPISODE_PREFIX_MIN_STEPS:-96}" \
+      EPISODE_PREFIX_MAX_STEPS="${A_EPISODE_PREFIX_MAX_STEPS:-160}" \
       REGRASP_WINDOW_ENABLED=false \
       FINAL_RELEASE_WINDOW_ENABLED=false \
       RELEASE_ENABLED=false \
@@ -328,6 +371,7 @@ run_stage_chunk() {
       # B v5 learns stable frame assembly while keeping the grasp. Release is
       # deliberately deferred to C; otherwise the insert stage learns to drop
       # the frame near the stand before it is seated.
+      echo "[AUTO] B recipe=insert_only_v5 lr=1e-5 action_steps=4 release=false metric=stage_insert_rate"
       RUN_NAME="${run_name}" \
       NUM_EPOCHS="${target_epoch}" \
       ROLLOUT_START_EPOCH="${FIRST_EVAL_EPOCH}" \
@@ -430,6 +474,7 @@ run_until_pass() {
   local minimum_epoch=0
   local maximum_epoch=0
   local pass_count=0
+  local BEST_CKPT=""
 
   run_name="$(stage_run_name "${stage}")"
   threshold="$(stage_pass_score "${stage}")"
@@ -462,9 +507,12 @@ run_until_pass() {
     passed="$(score_passed "${score}" "${threshold}")"
     pass_count="$(consecutive_passes "${run_name}" "${metric}" "${threshold}")"
     ckpt="$(latest_ckpt "${run_name}")"
+    metric_epoch="$(latest_metric_epoch "${run_name}" "${metric}")"
+    record_best_checkpoint "${stage}" "${run_name}" "${metric}" "${score}" "${metric_epoch}"
     if [[ "${passed}" == "yes" && "${cur}" -ge "${minimum_epoch}" && "${pass_count}" -ge "${REQUIRED_CONSECUTIVE_PASSES}" && -n "${ckpt}" ]]; then
       echo "[AUTO] ${stage} gate was already passed: ${metric}=${score}, epoch=${cur}, consecutive=${pass_count}."
-      PASSED_CKPT="${ckpt}"
+      PASSED_CKPT="${BEST_CKPT:-${ckpt}}"
+      echo "[AUTO] ${stage} transfer checkpoint: ${PASSED_CKPT}"
       return 0
     fi
 
@@ -533,6 +581,7 @@ run_until_pass() {
     fi
     passed="$(score_passed "${score}" "${threshold}")"
     pass_count="$(consecutive_passes "${run_name}" "${metric}" "${threshold}")"
+    record_best_checkpoint "${stage}" "${run_name}" "${metric}" "${score}" "${metric_epoch}"
     echo "[AUTO] ${stage} latest ${metric}=${score}, threshold=${threshold}, epoch=${cur}/${minimum_epoch}, consecutive=${pass_count}/${REQUIRED_CONSECUTIVE_PASSES}"
     if [[ "${stage}" == "A_HOLD" ]]; then
       contact_score="$(latest_score "${run_name}" "test/frame_grasp_contact_rate")"
@@ -572,8 +621,8 @@ run_until_pass() {
         echo "[ERROR] ${stage} passed but latest checkpoint is missing for ${run_name}." >&2
         exit 4
       fi
-      echo "[AUTO] ${stage} passed. checkpoint=${ckpt}"
-      PASSED_CKPT="${ckpt}"
+      PASSED_CKPT="${BEST_CKPT:-${ckpt}}"
+      echo "[AUTO] ${stage} passed. transfer_checkpoint=${PASSED_CKPT}"
       return 0
     fi
 
