@@ -17,7 +17,7 @@ set -euo pipefail
 DP_REPO="${DP_REPO:-../diffusion_policy}"
 DEVICE="${DEVICE:-cuda:0}"
 TASKS="${TASKS:-pusht lift_ph can_ph square_ph tool_hang_ph transport_ph}"
-SEEDS="${SEEDS:-42}"
+SEEDS="${SEEDS:-42 43 44}"
 RUN_DEFAULT="${RUN_DEFAULT:-true}"
 RUN_STEP6="${RUN_STEP6:-true}"
 WANDB_MODE="${WANDB_MODE:-offline}"
@@ -36,7 +36,7 @@ Usage:
 Environment overrides:
   DP_REPO          External Diffusion Policy repo. Default: ../diffusion_policy
   TASKS            Space-separated tasks. Default: pusht lift_ph can_ph square_ph tool_hang_ph transport_ph
-  SEEDS            Space-separated seeds. Default: 42
+  SEEDS            Space-separated seeds. Default: 42 43 44
   DEVICE           Training device. Default: cuda:0
   RUN_DEFAULT      Run official DP config. Default: true
   RUN_STEP6        Run DP with policy.num_inference_steps=6. Default: true

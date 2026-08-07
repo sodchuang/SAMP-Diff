@@ -44,6 +44,10 @@ class RobomimicReplayLowdimDataset(BaseLowdimDataset):
             episode_prefix_min_steps=None,
             episode_prefix_max_steps=None,
             episode_prefix_min_anchor_ratio=0.9,
+            anchor_oversample_enabled=False,
+            anchor_oversample_before=48,
+            anchor_oversample_after=8,
+            anchor_oversample_repeats=1,
         ):
         obs_keys = list(obs_keys)
         rotation_transformer = RotationTransformer(
@@ -175,6 +179,72 @@ class RobomimicReplayLowdimDataset(BaseLowdimDataset):
             pad_before=pad_before, 
             pad_after=pad_after,
             episode_mask=train_mask)
+
+        # A phase-loss window can only see events that fall inside the sampled
+        # horizon. ToolHang uses horizon=16, so configuring a 48-step window
+        # before first release did not actually emphasize most of the insertion
+        # approach. Repeat the relevant sequence indices at the dataset level
+        # instead. This keeps the full A->B trajectory available while making
+        # alignment / insertion chunks occur often enough to learn.
+        if anchor_oversample_enabled:
+            if not episode_prefix_enabled:
+                raise ValueError(
+                    "anchor_oversample_enabled requires "
+                    "episode_prefix_enabled so anchor indices are available")
+            repeats = int(anchor_oversample_repeats)
+            before = int(anchor_oversample_before)
+            after = int(anchor_oversample_after)
+            if repeats < 1:
+                raise ValueError(
+                    "anchor_oversample_repeats must be at least 1")
+            if before < 0 or after < 0:
+                raise ValueError(
+                    "anchor_oversample_before/after must be non-negative")
+
+            episode_ends = replay_buffer.episode_ends[:]
+            episode_starts = np.concatenate(
+                [np.zeros(1, dtype=episode_ends.dtype), episode_ends[:-1]])
+            focus_mask = np.zeros(len(sampler.indices), dtype=bool)
+            buffer_starts = sampler.indices[:, 0]
+            buffer_ends = sampler.indices[:, 1]
+            usable_anchors = 0
+            for episode_idx, anchor_idx in enumerate(prefix_anchor_indices):
+                if (
+                    anchor_idx is None
+                    or not train_mask[episode_idx]
+                    or anchor_idx >= prefix_lengths[episode_idx]
+                ):
+                    continue
+                usable_anchors += 1
+                global_anchor = (
+                    int(episode_starts[episode_idx]) + int(anchor_idx))
+                focus_start = max(
+                    int(episode_starts[episode_idx]),
+                    global_anchor - before)
+                focus_end = min(
+                    int(episode_ends[episode_idx]),
+                    global_anchor + after + 1)
+                focus_mask |= (
+                    (buffer_ends > focus_start)
+                    & (buffer_starts < focus_end)
+                )
+
+            focus_indices = sampler.indices[focus_mask]
+            if usable_anchors == 0 or len(focus_indices) == 0:
+                raise ValueError(
+                    "anchor oversampling found no usable training windows")
+            if repeats > 1:
+                sampler.indices = np.concatenate(
+                    [sampler.indices]
+                    + [focus_indices.copy() for _ in range(repeats - 1)],
+                    axis=0)
+            print(
+                "[Dataset] anchor oversampling enabled: "
+                f"anchor={episode_prefix_anchor}, before={before}, "
+                f"after={after}, repeats={repeats}, "
+                f"focus_samples={len(focus_indices)}, "
+                f"total_samples={len(sampler.indices)}, "
+                f"usable_anchors={usable_anchors}")
         
         self.replay_buffer = replay_buffer
         self.sampler = sampler
@@ -439,7 +509,18 @@ def _infer_gripper_close_semantics(demos, max_demos=64):
         n = min(len(action), len(qpos))
         if n < 2:
             continue
-        command = action[:n - 1, -1].reshape(-1)
+        # Raw robomimic dual-arm actions are
+        # [robot0(pos3, rot3, grip1), robot1(pos3, rot3, grip1)].
+        # The old -1 indexing paired robot1's command with robot0's observed
+        # finger width and could infer the wrong close direction.
+        if action.shape[-1] == 14:
+            robot0_gripper_index = 6
+        elif action.shape[-1] == 20:
+            # Also support datasets that already store rotation-6D actions.
+            robot0_gripper_index = 9
+        else:
+            robot0_gripper_index = action.shape[-1] - 1
+        command = action[:n - 1, robot0_gripper_index].reshape(-1)
         width = np.abs(qpos[1:n]).reshape(n - 1, -1).sum(axis=-1)
         finite = np.isfinite(command) & np.isfinite(width)
         commands.append(command[finite])

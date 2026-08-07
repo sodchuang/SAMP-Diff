@@ -8,6 +8,23 @@ fi
 extra_overrides=("$@")
 
 case "${variant}" in
+  HOMO)
+    name="square_homogeneous_prior_seed42"
+    history_enabled="false"
+    translation_rate="1.0"
+    rotation_rate="1.0"
+    gripper_rate="1.0"
+    # Applied last so Hydra first accepts the normal Square group fields and
+    # then collapses them into the homogeneous source-prior control.
+    extra_overrides+=("policy.action_group_spectral_params=null")
+    ;;
+  SP)
+    name="square_semantic_prior_only_seed42"
+    history_enabled="false"
+    translation_rate="1.0"
+    rotation_rate="1.0"
+    gripper_rate="1.0"
+    ;;
   H0)
     name="square_history_legacy_rot015_6000"
     history_enabled="false"
@@ -47,6 +64,24 @@ case "${variant}" in
     gripper_history="false"
     phase_loss_enabled="true"
     ;;
+  GC_ONLY)
+    name="square_grasp_coordination_only_seed42"
+    history_enabled="false"
+    translation_rate="1.0"
+    rotation_rate="1.0"
+    gripper_rate="1.0"
+    gripper_history="false"
+    phase_loss_enabled="true"
+    ;;
+  FULL)
+    name="square_hg_gc_full_seed42"
+    history_enabled="true"
+    translation_rate="1.0"
+    rotation_rate="1.0"
+    gripper_rate="1.0"
+    gripper_history="false"
+    phase_loss_enabled="true"
+    ;;
   GCR)
     name="square_grasp_release_coordination_rot015_7000"
     history_enabled="true"
@@ -61,7 +96,7 @@ case "${variant}" in
     rollout_every="${ROLLOUT_EVERY:-100}"
     ;;
   *)
-    echo "Usage: $0 {H0|H1|H2|HG|GC|GCR}" >&2
+    echo "Usage: $0 {HOMO|SP|HG|GC_ONLY|FULL|H0|H1|H2|GC|GCR}" >&2
     exit 2
     ;;
 esac
@@ -75,6 +110,8 @@ name="${RUN_NAME:-${name}}"
 num_epochs="${NUM_EPOCHS:-${num_epochs:-6000}}"
 rollout_every="${ROLLOUT_EVERY:-${rollout_every:-50}}"
 n_envs="${N_ENVS:-28}"
+output_root="${OUTPUT_ROOT:-data/outputs/robomimic}"
+history_training_mode="${HISTORY_TRAINING_MODE:-legacy_shift}"
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
@@ -82,7 +119,7 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
 
 python train.py --config-name=square_ph \
-  "hydra.run.dir=data/outputs/robomimic/${name}" \
+  "hydra.run.dir=${output_root}/${name}" \
   training.resume=false \
   "training.num_epochs=${num_epochs}" \
   "training.rollout_every=${rollout_every}" \
@@ -106,6 +143,7 @@ python train.py --config-name=square_ph \
   "policy.action_group_history_params.groups.rotation.update_rate=${rotation_rate}" \
   "policy.action_group_history_params.groups.gripper.use_history=${gripper_history}" \
   "policy.action_group_history_params.groups.gripper.update_rate=${gripper_rate}" \
+  "++policy.history_training_mode=${history_training_mode}" \
   "policy.action_phase_loss_params.enabled=${phase_loss_enabled}" \
   "policy.action_phase_loss_params.weight=${phase_loss_weight}" \
   policy.action_phase_loss_params.transition_radius=2 \

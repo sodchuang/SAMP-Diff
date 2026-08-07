@@ -6,13 +6,21 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 LOG_FILE="${TOOL_HANG_LOG_FILE:-${PROJECT_ROOT}/toolhang.log}"
 CONDA_ROOT="${CONDA_ROOT:-/root/miniforge3}"
 CONDA_ENV="${CONDA_ENV:-robodiff310}"
-EXPECTED_PIPELINE="toolhang_direction_guard_v8_isolated"
+EXPECTED_PIPELINE="toolhang_direction_guard_v9_4_2_continuous50"
 
 cd "${PROJECT_ROOT}"
 
 if [[ ! -f train.py || ! -f scripts/run_tool_hang_auto_curriculum.sh ]]; then
   echo "[RESTART] invalid project root: ${PROJECT_ROOT}" >&2
   exit 2
+fi
+
+if [[ "${START_FROM_A:-false}" == "true" ]]; then
+  unset A_CHECKPOINT_PATH
+  export AUTO_RESUME_LATEST=false
+  export BASE_RUN_NAME="${BASE_RUN_NAME:-tool_hang_full_v9_4_2_from_scratch_$(date +%Y%m%d_%H%M%S)}"
+  echo "[RESTART] START_FROM_A=true"
+  echo "[RESTART] creating a clean A->B->C run: ${BASE_RUN_NAME}"
 fi
 
 actual_pipeline="$(

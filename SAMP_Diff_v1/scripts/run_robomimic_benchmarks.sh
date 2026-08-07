@@ -5,37 +5,42 @@
 #   cd SAMP_Diff_v1
 #   bash scripts/run_robomimic_benchmarks.sh
 #
-# Common runs:
-#   RUN_FILTER=MAIN DEVICE=cuda:0 bash scripts/run_robomimic_benchmarks.sh
-#   RUN_FILTER=DIAG DIAG_TASKS="lift_ph can_ph" bash scripts/run_robomimic_benchmarks.sh
-#   RUN_FILTER=STEPS STEP_TASKS="can_ph square_ph" bash scripts/run_robomimic_benchmarks.sh
-#   RUN_FILTER=ABLATION ABLATION_TASKS="can_ph" bash scripts/run_robomimic_benchmarks.sh
-#   RUN_FILTER=SEEDS SEED_TASKS="can_ph square_ph" SEEDS="42 43 44" bash scripts/run_robomimic_benchmarks.sh
-#   RUN_FILTER=ALL bash scripts/run_robomimic_benchmarks.sh
+# Paper positioning:
+#   human-designed semantic structure + learned conditional flow coordination.
+#
+# Recommended order when seed 42 already exists:
+#   RUN_FILTER=MAIN SEEDS="43 44" bash scripts/run_robomimic_benchmarks.sh
+#   RUN_FILTER=STRUCTURE STRUCTURE_SEEDS="42 43 44" bash scripts/run_robomimic_benchmarks.sh
+#   RUN_FILTER=DATA DATA_SEEDS="42" bash scripts/run_robomimic_benchmarks.sh
+#   RUN_FILTER=STEPS bash scripts/run_robomimic_benchmarks.sh
 #
 # RUN_FILTER options:
-#   MAIN      Main 6-step SAMP-Diff on core robomimic PH tasks.
+#   MAIN      Semantic-prior SAMP on every task and every requested seed.
+#   STRUCTURE Human semantic grouping vs homogeneous and wrong grouping.
+#   DATA      Data-efficiency comparison for semantic vs homogeneous priors.
 #   DIAG      Compact Lift/Can diagnostics for action horizon and model capacity.
-#   STEPS     Inference-step scaling on Can/Square by default.
-#   ABLATION  Small reviewer-facing ablations on Can by default.
-#   SEEDS     Extra main-method seeds on Can/Square by default.
-#   ALL       Run all of the above.
+#   STEPS     Secondary inference-step analysis; not the main contribution.
+#   PAPER     MAIN + STRUCTURE + DATA.
+#   ALL       PAPER + DIAG + STEPS.
 
 set -euo pipefail
 
 DEVICE="${DEVICE:-cuda:0}"
 NUM_EPOCHS="${NUM_EPOCHS:-6000}"
 DATA_ROOT="${DATA_ROOT:-data/robomimic/datasets}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-data/outputs/robomimic_benchmark_6000}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-data/outputs/semantic_prior_generalization}"
 RUN_FILTER="${RUN_FILTER:-MAIN}"
 RESUME="${RESUME:-true}"
 WANDB_MODE="${WANDB_MODE:-offline}"
 ROLLOUT_EVERY="${ROLLOUT_EVERY:-}"
 BATCH_SIZE="${BATCH_SIZE:-}"
 NUM_WORKERS="${NUM_WORKERS:-}"
+TEST_START_SEED="${TEST_START_SEED:-100000}"
+N_TEST="${N_TEST:-50}"
 
-# Main table: prioritize tasks that best show transfer beyond PushT.
+# Main table: cross-task applicability of the same hybrid design philosophy.
 MAIN_TASKS="${MAIN_TASKS:-can_ph square_ph transport_ph lift_ph}"
+SEEDS="${SEEDS:-42 43 44}"
 
 # Diagnostic grid: run this before large benchmark sweeps when Lift/Can plateau.
 DIAG_TASKS="${DIAG_TASKS:-lift_ph can_ph}"
@@ -44,12 +49,17 @@ DIAG_TASKS="${DIAG_TASKS:-lift_ph can_ph}"
 STEP_TASKS="${STEP_TASKS:-can_ph square_ph}"
 STEP_VALUES="${STEP_VALUES:-2 4 6 8}"
 
-# Small robomimic ablation grid. Keep this compact; PushT remains the main ablation task.
-ABLATION_TASKS="${ABLATION_TASKS:-can_ph}"
+# Structure ablation directly tests the paper claim. Can represents
+# pick-and-place; Square represents rotation-sensitive insertion.
+STRUCTURE_TASKS="${STRUCTURE_TASKS:-can_ph square_ph}"
+STRUCTURE_SEEDS="${STRUCTURE_SEEDS:-42 43 44}"
 
-# Multi-seed confirmation for the main method.
-SEED_TASKS="${SEED_TASKS:-can_ph square_ph}"
-SEEDS="${SEEDS:-42 43 44}"
+# Data efficiency tests whether human structure is especially useful when
+# demonstrations are scarce. Start with seed 42, then repeat the selected
+# budget with 43/44 for the final paper.
+DATA_TASKS="${DATA_TASKS:-can_ph square_ph}"
+DATA_SEEDS="${DATA_SEEDS:-42}"
+DATA_EPISODES="${DATA_EPISODES:-10 25 50}"
 
 export WANDB_MODE
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
@@ -61,7 +71,16 @@ mkdir -p "${OUTPUT_ROOT}"
 
 should_run_section() {
     local section="$1"
-    [[ "${RUN_FILTER}" == "ALL" || "${RUN_FILTER}" == "${section}" ]]
+    if [[ "${RUN_FILTER}" == "ALL" || "${RUN_FILTER}" == "${section}" ]]; then
+        return 0
+    fi
+    if [[ "${RUN_FILTER}" == "PAPER" ]]; then
+        [[ "${section}" == "MAIN" \
+            || "${section}" == "STRUCTURE" \
+            || "${section}" == "DATA" ]]
+        return
+    fi
+    return 1
 }
 
 dataset_path() {
@@ -118,6 +137,8 @@ run_train() {
         "logging.mode=${WANDB_MODE}"
         "logging.project=samp_diff_robomimic_benchmark"
         "logging.name=${exp_name}"
+        "task.env_runner.test_start_seed=${TEST_START_SEED}"
+        "task.env_runner.n_test=${N_TEST}"
         "policy.sigma=0.3"
         "policy.cold_start_prob=0.3"
         "policy.freq_split_low=0"
@@ -141,6 +162,7 @@ run_train() {
     echo "  purpose    : ${purpose}"
     echo "  seed       : ${seed}"
     echo "  target ep  : ${NUM_EPOCHS}"
+    echo "  test bank  : ${TEST_START_SEED}..$((TEST_START_SEED + N_TEST - 1))"
     echo "  output_dir : ${output_dir}"
     echo "  resume     : ${RESUME}"
     echo "================================================================="
@@ -150,10 +172,12 @@ run_train() {
 
 if should_run_section "MAIN"; then
     for task in ${MAIN_TASKS}; do
-        run_train \
-            "MAIN" "${task}" "main_${task}_step6_seed42" "42" \
-            "Main SAMP-Diff 6-step robomimic result" \
-            "policy.num_inference_steps=6"
+        for seed in ${SEEDS}; do
+            run_train \
+                "MAIN" "${task}" "semantic_${task}_step6_seed${seed}" "${seed}" \
+                "Human-designed action semantics with learned flow coordination" \
+                "policy.num_inference_steps=6"
+        done
     done
 fi
 
@@ -192,57 +216,54 @@ if should_run_section "STEPS"; then
     done
 fi
 
-if should_run_section "ABLATION"; then
-    for task in ${ABLATION_TASKS}; do
-        run_train \
-            "ABLATION" "${task}" "abl_${task}_full_warm_step6_seed42" "42" \
-            "Full-frequency warm-start baseline" \
-            "policy.num_inference_steps=6" \
-            "policy.freq_split_high=16" \
-            "policy.sigma_high=0.3"
+if should_run_section "STRUCTURE"; then
+    for task in ${STRUCTURE_TASKS}; do
+        for seed in ${STRUCTURE_SEEDS}; do
+            # The semantic result is produced by MAIN with the same task/seed.
+            # Homogeneous keeps the learned flow model but removes human action
+            # grouping, so all action dimensions share one source prior.
+            run_train \
+                "STRUCTURE" "${task}" \
+                "structure_${task}_homogeneous_step6_seed${seed}" "${seed}" \
+                "Homogeneous hand-agnostic source prior control" \
+                "policy.num_inference_steps=6" \
+                "policy.action_group_spectral_params=null"
 
-        run_train \
-            "ABLATION" "${task}" "abl_${task}_split08_random_high_step6_seed42" "42" \
-            "High-frequency random control" \
-            "policy.num_inference_steps=6" \
-            "policy.freq_split_high=8" \
-            "policy.sigma_high=-1.0"
-
-        run_train \
-            "ABLATION" "${task}" "abl_${task}_split08_sh02_step6_seed42" "42" \
-            "Main weak high-frequency anchor" \
-            "policy.num_inference_steps=6" \
-            "policy.freq_split_high=8" \
-            "policy.sigma_high=0.2"
-
-        run_train \
-            "ABLATION" "${task}" "abl_${task}_split08_sh05_step6_seed42" "42" \
-            "Strong high-frequency perturbation control" \
-            "policy.num_inference_steps=6" \
-            "policy.freq_split_high=8" \
-            "policy.sigma_high=0.5"
-
-        run_train \
-            "ABLATION" "${task}" "abl_${task}_cold0p0_step6_seed42" "42" \
-            "No cold-start control" \
-            "policy.num_inference_steps=6" \
-            "policy.cold_start_prob=0.0"
-
-        run_train \
-            "ABLATION" "${task}" "abl_${task}_cold0p3_step6_seed42" "42" \
-            "Main cold-start probability" \
-            "policy.num_inference_steps=6" \
-            "policy.cold_start_prob=0.3"
+            # Parameter count and group sizes match the semantic model, but
+            # translation and rotation dimensions are deliberately assigned to
+            # the wrong groups. This isolates semantic correctness from merely
+            # having multiple parameter groups.
+            run_train \
+                "STRUCTURE" "${task}" \
+                "structure_${task}_wrong_groups_step6_seed${seed}" "${seed}" \
+                "Wrong-group control with matched model capacity" \
+                "policy.num_inference_steps=6" \
+                "policy.action_group_spectral_params.translation.indices=[3,4,5]" \
+                "policy.action_group_spectral_params.rotation.indices=[0,1,2,6,7,8]" \
+                "policy.action_group_spectral_params.gripper.indices=[9]"
+        done
     done
 fi
 
-if should_run_section "SEEDS"; then
-    for task in ${SEED_TASKS}; do
-        for seed in ${SEEDS}; do
-            run_train \
-                "SEEDS" "${task}" "seed_${task}_step6_seed${seed}" "${seed}" \
-                "Main SAMP-Diff 6-step multi-seed confirmation" \
-                "policy.num_inference_steps=6"
+if should_run_section "DATA"; then
+    for task in ${DATA_TASKS}; do
+        for seed in ${DATA_SEEDS}; do
+            for episodes in ${DATA_EPISODES}; do
+                run_train \
+                    "DATA" "${task}" \
+                    "data_${task}_semantic_ep${episodes}_seed${seed}" "${seed}" \
+                    "Semantic prior with limited demonstrations" \
+                    "policy.num_inference_steps=6" \
+                    "data_split.max_train_episodes=${episodes}"
+
+                run_train \
+                    "DATA" "${task}" \
+                    "data_${task}_homogeneous_ep${episodes}_seed${seed}" "${seed}" \
+                    "Homogeneous prior with limited demonstrations" \
+                    "policy.num_inference_steps=6" \
+                    "data_split.max_train_episodes=${episodes}" \
+                    "policy.action_group_spectral_params=null"
+            done
         done
     done
 fi

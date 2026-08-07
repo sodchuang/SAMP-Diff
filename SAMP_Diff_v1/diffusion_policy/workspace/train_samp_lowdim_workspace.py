@@ -14,6 +14,7 @@ from omegaconf import OmegaConf
 import pathlib
 from torch.utils.data import DataLoader
 import copy
+import dill
 import numpy as np
 import random
 import wandb
@@ -82,7 +83,7 @@ def _is_mujoco_instability_error(exc):
 
 
 class TrainSampLowdimWorkspace(BaseWorkspace):
-    include_keys = ['global_step', 'epoch']
+    include_keys = ['global_step', 'epoch', 'ema_optimization_step']
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
         super().__init__(cfg, output_dir=output_dir)
@@ -108,6 +109,10 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
 
         self.global_step = 0
         self.epoch = 0
+        # Kept separately from the stage-local logging step. Cross-stage
+        # transfer resets global_step so the new run has clean logs and a new
+        # scheduler, but EMA warmup must continue from the source checkpoint.
+        self.ema_optimization_step = 0
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
@@ -123,15 +128,35 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
             if cfg.training.resume:
                 # Same-run resume: restore the complete training state.
                 self.load_checkpoint(path=resume_from_path)
+                # Checkpoints are written after the epoch's optimization and
+                # rollout, but before end-of-epoch counters are incremented.
+                # Continue at the next epoch instead of training the saved
+                # boundary epoch a second time.
+                self.epoch += 1
+                self.global_step += 1
+                print(
+                    "[Resume] advanced past completed checkpoint boundary: "
+                    f"next_epoch={self.epoch}, "
+                    f"next_global_step={self.global_step}"
+                )
             else:
                 # Cross-stage transfer: keep this stage's output directory and
                 # optimizer, while inheriting model weights and epoch. Loading
                 # _output_dir/global_step would break the new stage's save/LR state.
-                self.load_checkpoint(
+                payload = self.load_checkpoint(
                     path=resume_from_path,
                     exclude_keys=('optimizer',),
                     include_keys=('epoch',),
                 )
+                source_global_step = payload.get('pickles', {}).get(
+                    'global_step', None)
+                if source_global_step is not None:
+                    self.ema_optimization_step = max(
+                        0, int(dill.loads(source_global_step)))
+                    print(
+                        "[Transfer] inherited EMA schedule from source "
+                        f"global_step={self.ema_optimization_step}"
+                    )
                 # The stage gate evaluates ema_model. Promote exactly those
                 # validated weights into the train model for the next stage.
                 if self.ema_model is not None:
@@ -145,6 +170,13 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
             if lastest_ckpt_path.is_file():
                 print(f"Resuming from checkpoint {lastest_ckpt_path}")
                 self.load_checkpoint(path=lastest_ckpt_path)
+                self.epoch += 1
+                self.global_step += 1
+                print(
+                    "[Resume] advanced past completed checkpoint boundary: "
+                    f"next_epoch={self.epoch}, "
+                    f"next_global_step={self.global_step}"
+                )
 
         # configure dataset
         dataset: BaseLowdimDataset
@@ -278,7 +310,11 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
         ema: EMAModel = None
         if cfg.training.use_ema:
             ema = hydra.utils.instantiate(cfg.ema, model=self.ema_model)
-            ema.optimization_step = max(0, int(self.global_step))
+            ema.optimization_step = max(
+                0,
+                int(self.ema_optimization_step),
+                int(self.global_step),
+            )
             ema.decay = ema.get_decay(ema.optimization_step)
             print(
                 "[Training] restored EMA schedule at "
@@ -333,6 +369,74 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
             self.ema_model.to(device)
         optimizer_to(self.optimizer, device)
 
+        # Optional L2-SP-style proximal anchoring for curriculum transfers.
+        # The stage may learn a new event (insert/release), but every optimizer
+        # step is pulled slightly toward the already validated source policy so
+        # that earlier skills are not silently overwritten.
+        parameter_anchor_rate = float(
+            cfg.training.get('parameter_anchor_rate', 0.0)
+        )
+        parameter_anchor_path = cfg.training.get(
+            'parameter_anchor_path', None
+        )
+        anchor_parameters = None
+        if parameter_anchor_rate < 0.0 or parameter_anchor_rate >= 1.0:
+            raise ValueError(
+                "training.parameter_anchor_rate must be in [0, 1)"
+            )
+        if parameter_anchor_rate > 0.0:
+            if not parameter_anchor_path:
+                raise ValueError(
+                    "training.parameter_anchor_path is required when "
+                    "parameter_anchor_rate > 0"
+                )
+            parameter_anchor_path = pathlib.Path(
+                os.path.expanduser(str(parameter_anchor_path))
+            )
+            if not parameter_anchor_path.is_file():
+                raise FileNotFoundError(
+                    "parameter_anchor_path not found: "
+                    f"{parameter_anchor_path}"
+                )
+            anchor_payload = torch.load(
+                parameter_anchor_path.open('rb'),
+                pickle_module=dill,
+                map_location='cpu',
+            )
+            anchor_state_dicts = anchor_payload.get('state_dicts', {})
+            anchor_state = anchor_state_dicts.get(
+                'ema_model',
+                anchor_state_dicts.get('model', None),
+            )
+            if anchor_state is None:
+                raise KeyError(
+                    "parameter anchor checkpoint contains neither "
+                    "'ema_model' nor 'model'"
+                )
+            anchor_parameters = {}
+            for name, parameter in self.model.named_parameters():
+                if name not in anchor_state:
+                    raise KeyError(
+                        f"parameter anchor is missing model parameter: {name}"
+                    )
+                reference = anchor_state[name]
+                if tuple(reference.shape) != tuple(parameter.shape):
+                    raise ValueError(
+                        "parameter anchor shape mismatch for "
+                        f"{name}: {tuple(reference.shape)} != "
+                        f"{tuple(parameter.shape)}"
+                    )
+                anchor_parameters[name] = reference.detach().to(
+                    device=device,
+                    dtype=parameter.dtype,
+                )
+            print(
+                "[Transfer] parameter anchoring enabled: "
+                f"path={parameter_anchor_path}, "
+                f"rate={parameter_anchor_rate:.8g}, "
+                f"parameters={len(anchor_parameters)}"
+            )
+
         train_sampling_batch = None
 
         if cfg.training.debug:
@@ -384,6 +488,14 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
                     policy.to(device)
                 wandb_run.log(baseline_log, step=self.global_step)
                 json_logger.log(baseline_log)
+                # The source checkpoint epoch has already completed in the
+                # previous stage. Its rollout above is only the transfer
+                # baseline; curriculum optimization starts at the next epoch.
+                self.epoch += 1
+                print(
+                    "[Transfer] advanced to first curriculum training epoch: "
+                    f"next_epoch={self.epoch}"
+                )
 
             if self.epoch >= cfg.training.num_epochs:
                 print(
@@ -427,11 +539,19 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
 
                         if self.global_step % cfg.training.gradient_accumulate_every == 0:
                             self.optimizer.step()
+                            if anchor_parameters is not None:
+                                with torch.no_grad():
+                                    for name, parameter in self.model.named_parameters():
+                                        parameter.lerp_(
+                                            anchor_parameters[name],
+                                            parameter_anchor_rate,
+                                        )
                             self.optimizer.zero_grad()
                             lr_scheduler.step()
 
                         if cfg.training.use_ema:
                             ema.step(self.model)
+                            self.ema_optimization_step = ema.optimization_step
 
                         raw_loss_cpu = raw_loss.item()
                         tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)

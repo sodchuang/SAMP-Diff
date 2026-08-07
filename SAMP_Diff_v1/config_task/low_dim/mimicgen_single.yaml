@@ -1,0 +1,78 @@
+defaults:
+  - square_ph
+  - _self_
+
+# Generic single-arm MimicGen low-dimensional task. The launcher validates and
+# overrides task_name, obs_dim, dataset_path, rollout horizon, and task-specific
+# semantic prior parameters for each dataset.
+obs_dim: 32
+action_dim: 7
+
+task_semantics:
+  domain: mimicgen
+  task_name: mimicgen_single
+  control_mode: delta_eef_pose
+  action_representation: delta_xyz_axis_angle_gripper
+  action_groups:
+    translation: [0, 1, 2]
+    rotation: [3, 4, 5]
+    gripper: [6]
+  diagnostics:
+    smooth_groups:
+      xyz: [0, 1, 2]
+    rotation_groups:
+      rotation: [3, 4, 5]
+    contact_groups:
+      gripper: [6]
+
+logging:
+  project: samp_mimicgen_single_tasks
+  name: mimicgen_single
+  tags: [samp_lowdim, mimicgen, single_task, semantic_prior]
+
+task:
+  # Official MimicGen demonstrations use the native robosuite OSC_POSE
+  # delta command. Do not reinterpret them as absolute poses.
+  abs_action: false
+  dataset_path: data/mimicgen/core/stack_d1.hdf5
+  dataset_type: core
+  dataset:
+    abs_action: false
+  env_runner:
+    abs_action: false
+
+policy:
+  action_group_spectral_params:
+    translation:
+      indices: [0, 1, 2]
+    rotation:
+      indices: [3, 4, 5]
+    gripper:
+      indices: [6]
+  action_group_loss_weights:
+    translation:
+      indices: [0, 1, 2]
+      weight: 1.0
+    rotation:
+      indices: [3, 4, 5]
+      weight: 1.0
+    gripper:
+      indices: [6]
+      weight: 1.0
+  action_group_history_params:
+    groups:
+      translation:
+        indices: [0, 1, 2]
+      rotation:
+        indices: [3, 4, 5]
+      gripper:
+        indices: [6]
+  action_group_timing_params:
+    gripper:
+      indices: [6]
+  action_phase_loss_params:
+    gripper_indices: [6]
+    translation_indices: [0, 1, 2]
+    rotation_indices: [3, 4, 5]
+    release_translation_indices: [0, 1, 2]
+    release_rotation_indices: [3, 4, 5]

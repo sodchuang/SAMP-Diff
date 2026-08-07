@@ -21,6 +21,20 @@ from diffusion_policy.env.robomimic.robomimic_lowdim_wrapper import RobomimicLow
 
 
 def create_env(env_meta, obs_keys):
+    env_name = str(env_meta.get('env_name', ''))
+    # MimicGen environments register themselves with robosuite at import
+    # time.  Without this import, dataset loading succeeds but the first
+    # rollout fails much later with an unknown-environment error.
+    if env_name in {'Stack_D1', 'NutAssembly_D0', 'Threading_D2'}:
+        try:
+            import mimicgen.envs.robosuite  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                f"Dataset requires MimicGen environment {env_name!r}, but "
+                "mimicgen.envs.robosuite is not importable. Install the "
+                "official MimicGen package in a compatible environment "
+                "before starting training."
+            ) from e
     import robomimic.utils.env_utils as EnvUtils
     import robomimic.utils.obs_utils as ObsUtils
 
@@ -70,6 +84,9 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
             tool_hang_hold_steps=10,
             tool_hang_insert_hold_steps=10,
             tool_hang_full_hold_steps=10,
+            stack_release_hold_steps=1,
+            stack_min_eef_distance=0.04,
+            stack_min_gripper_open_width=0.04,
             tqdm_interval_sec=5.0,
             n_envs=None
         ):
@@ -156,6 +173,9 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
                             tool_hang_hold_steps=tool_hang_hold_steps,
                             tool_hang_insert_hold_steps=tool_hang_insert_hold_steps,
                             tool_hang_full_hold_steps=tool_hang_full_hold_steps,
+                            stack_release_hold_steps=stack_release_hold_steps,
+                            stack_min_eef_distance=stack_min_eef_distance,
+                            stack_min_gripper_open_width=stack_min_gripper_open_width,
                         ),
                         video_recoder=VideoRecorder.create_h264(
                             fps=fps,
@@ -239,6 +259,12 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
         # env = SyncVectorEnv(env_fns)
 
         self.env_meta = env_meta
+        normalized_env_name = ''.join(
+            char for char in str(env_meta.get('env_name', '')).lower()
+            if char.isalnum()
+        )
+        self.is_tool_hang = 'toolhang' in normalized_env_name
+        self.is_stack = normalized_env_name.startswith('stack')
         self.env = env
         self.env_fns = env_fns
         self.env_seeds = env_seeds
@@ -330,6 +356,7 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
         all_video_paths = [None] * n_inits
         all_rewards = [None] * n_inits
         all_stage_flags = [None] * n_inits
+        all_stack_flags = [None] * n_inits
 
         for chunk_idx in range(n_chunks):
             start = chunk_idx * n_envs
@@ -406,8 +433,12 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
             # collect data for this round
             all_video_paths[this_global_slice] = env.render()[this_local_slice]
             all_rewards[this_global_slice] = env.call('get_attr', 'reward')[this_local_slice]
-            all_stage_flags[this_global_slice] = env.call(
-                'get_tool_hang_stage_flags')[this_local_slice]
+            if self.is_tool_hang:
+                all_stage_flags[this_global_slice] = env.call(
+                    'get_tool_hang_stage_flags')[this_local_slice]
+            if self.is_stack:
+                all_stack_flags[this_global_slice] = env.call(
+                    'get_stack_release_flags')[this_local_slice]
 
         # log
         max_rewards = collections.defaultdict(list)
@@ -429,12 +460,22 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
             i for i, flags in enumerate(all_stage_flags)
             if flags is None or not bool(flags.get('available', False))
         ]
-        if unavailable_stage_flags:
+        if self.is_tool_hang and unavailable_stage_flags:
             raise RuntimeError(
                 "ToolHang simulator-state metrics are unavailable for "
                 f"{len(unavailable_stage_flags)}/{n_inits} rollouts. "
                 "Check robosuite ToolHang compatibility and ensure the "
                 "ToolHang wrapper / runner files were synced together."
+            )
+        unavailable_stack_flags = [
+            i for i, flags in enumerate(all_stack_flags)
+            if flags is None or not bool(flags.get('available', False))
+        ]
+        if self.is_stack and unavailable_stack_flags:
+            raise RuntimeError(
+                "Stack simulator-state metrics are unavailable for "
+                f"{len(unavailable_stack_flags)}/{n_inits} rollouts. "
+                "Ensure the Stack wrapper and runner files were synced together."
             )
         # results reported in the paper are generated using the commented out line below
         # which will only report and average metrics from first n_envs initial condition and seeds
@@ -452,6 +493,30 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
             final_reward = float(reward_history[-1])
             stable_window = reward_history[-10:]
             stable_reward = float(np.all(stable_window >= 1.0))
+
+            stack_flags = all_stack_flags[i]
+            if self.is_stack:
+                # Do not count transient contact as Stack success. The main
+                # paper metric is 1 only when the cube remains released on the
+                # target and the gripper has moved away at the episode end.
+                raw_max_reward = max_reward
+                strict_score = float(bool(stack_flags.get(
+                    'strict_success', False)))
+                max_reward = strict_score
+                final_reward = strict_score
+                stable_reward = strict_score
+                log_data[prefix+f'sim_raw_max_reward_{seed}'] = raw_max_reward
+                log_data[prefix+f'stack_release_success_{seed}'] = strict_score
+                for key in (
+                    'final_released_stacked', 'final_gripper_away',
+                    'final_gripper_open',
+                    'seen_released_stacked', 'seen_gripper_away',
+                    'final_eef_distance', 'final_gripper_open_width',
+                    'release_consecutive_steps',
+                    'max_release_consecutive_steps',
+                ):
+                    log_data[prefix+f'stack_{key}_{seed}'] = float(
+                        stack_flags.get(key, 0.0))
             max_rewards[prefix].append(max_reward)
             final_rewards[prefix].append(final_reward)
             stable_rewards[prefix].append(stable_reward)
@@ -493,6 +558,15 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
             name = prefix+'mean_stable_score'
             value = float(np.mean(value))
             log_data[name] = value
+        if self.is_stack:
+            for prefix in ('train/', 'test/'):
+                values = [
+                    value for key, value in log_data.items()
+                    if key.startswith(prefix+'stack_release_success_')
+                ]
+                if values:
+                    log_data[prefix+'stack_release_rate'] = float(
+                        np.mean(values))
         for stage_name, prefix_values in stage_results.items():
             for prefix, value in prefix_values.items():
                 log_data[prefix+f'stage_{stage_name}_rate'] = float(

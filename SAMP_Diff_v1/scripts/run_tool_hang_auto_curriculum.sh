@@ -23,11 +23,17 @@ set -euo pipefail
 #   A_PASS_SCORE=0.80 B_PASS_SCORE=0.50 C_PASS_SCORE=0.50 bash scripts/run_tool_hang_auto_curriculum.sh
 #   MAX_STAGE_EPOCHS=3000 CHUNK_EPOCHS=200 bash scripts/run_tool_hang_auto_curriculum.sh
 
-PIPELINE_VERSION="toolhang_direction_guard_v8_isolated"
+PIPELINE_VERSION="toolhang_direction_guard_v9_4_2_continuous50"
 BASE_RUN_NAME="${BASE_RUN_NAME:-}"
 CHUNK_EPOCHS="${CHUNK_EPOCHS:-50}"
 FIRST_EVAL_EPOCH="${FIRST_EVAL_EPOCH:-300}"
 ROLLOUT_EVERY="${ROLLOUT_EVERY:-50}"
+B_CHUNK_EPOCHS="${B_CHUNK_EPOCHS:-50}"
+B_ROLLOUT_EVERY="${B_ROLLOUT_EVERY:-50}"
+B_CHECKPOINT_EVERY="${B_CHECKPOINT_EVERY:-50}"
+C_CHUNK_EPOCHS="${C_CHUNK_EPOCHS:-50}"
+C_ROLLOUT_EVERY="${C_ROLLOUT_EVERY:-50}"
+C_CHECKPOINT_EVERY="${C_CHECKPOINT_EVERY:-50}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-50}"
 N_ENVS="${N_ENVS:-8}"
 MAX_STAGE_EPOCHS="${MAX_STAGE_EPOCHS:-7000}"
@@ -36,8 +42,19 @@ A_MAX_EPOCHS="${A_MAX_EPOCHS:-3000}"
 A_PASS_SCORE="${A_PASS_SCORE:-0.80}"
 B_PASS_SCORE="${B_PASS_SCORE:-0.50}"
 C_PASS_SCORE="${C_PASS_SCORE:-0.50}"
+B_MIN_GRASP_SCORE="${B_MIN_GRASP_SCORE:-0.75}"
+B_ABORT_GRASP_SCORE="${B_ABORT_GRASP_SCORE:-0.55}"
+B_GRASP_GUARD_ADDED_EPOCHS="${B_GRASP_GUARD_ADDED_EPOCHS:-50}"
+B_GUARD_REQUIRED_CONSECUTIVE="${B_GUARD_REQUIRED_CONSECUTIVE:-2}"
+C_MIN_GRASP_SCORE="${C_MIN_GRASP_SCORE:-0.75}"
+C_MIN_INSERT_SCORE="${C_MIN_INSERT_SCORE:-0.40}"
+C_ABORT_GRASP_SCORE="${C_ABORT_GRASP_SCORE:-0.55}"
+C_ABORT_INSERT_SCORE="${C_ABORT_INSERT_SCORE:-0.25}"
+C_PRESERVATION_GUARD_ADDED_EPOCHS="${C_PRESERVATION_GUARD_ADDED_EPOCHS:-50}"
+C_GUARD_REQUIRED_CONSECUTIVE="${C_GUARD_REQUIRED_CONSECUTIVE:-2}"
 B_PASS_ADDED_EPOCHS="${B_PASS_ADDED_EPOCHS:-2000}"
-B_FREEZE_ENCODER_ADDED_EPOCHS="${B_FREEZE_ENCODER_ADDED_EPOCHS:-300}"
+B_FREEZE_ENCODER_ADDED_EPOCHS="${B_FREEZE_ENCODER_ADDED_EPOCHS:-1000}"
+C_FREEZE_ENCODER_ADDED_EPOCHS="${C_FREEZE_ENCODER_ADDED_EPOCHS:-1000}"
 A_REQUIRED_CONSECUTIVE_PASSES="${A_REQUIRED_CONSECUTIVE_PASSES:-2}"
 B_REQUIRED_CONSECUTIVE_PASSES="${B_REQUIRED_CONSECUTIVE_PASSES:-2}"
 C_REQUIRED_CONSECUTIVE_PASSES="${C_REQUIRED_CONSECUTIVE_PASSES:-2}"
@@ -169,10 +186,14 @@ require_project_root() {
     "diffusion_policy/dataset/robomimic_replay_lowdim_dataset.py:normalizer_use_full_dataset"
     "diffusion_policy/dataset/robomimic_replay_lowdim_dataset.py:episode prefix anchor coverage is too low"
     "diffusion_policy/workspace/train_samp_lowdim_workspace.py:lr_scheduler_start_epoch"
+    "diffusion_policy/workspace/train_samp_lowdim_workspace.py:parameter anchoring enabled"
+    "diffusion_policy/workspace/train_samp_lowdim_workspace.py:advanced past completed checkpoint boundary"
+    "diffusion_policy/workspace/train_samp_lowdim_workspace.py:advanced to first curriculum training epoch"
     "config_task/low_dim/tool_hang_ph.yaml:normalizer_use_full_dataset: true"
     "config_task/low_dim/tool_hang_ph.yaml:episode_prefix_min_anchor_ratio: 0.9"
     "scripts/run_tool_hang_rescue.sh:policy.history_training_mode"
     "scripts/run_tool_hang_rescue.sh:training.lr_scheduler_start_epoch"
+    "scripts/run_tool_hang_rescue.sh:training.parameter_anchor_rate"
     "scripts/run_tool_hang_rescue.sh:logging.mode"
     "scripts/run_tool_hang_auto_curriculum.sh:A_DIRECTION_CHECK_EPOCH"
   )
@@ -348,6 +369,39 @@ for _, value in sorted(values_by_epoch.items(), reverse=True):
 print(count)"
 }
 
+consecutive_failures() {
+  local run_name="$1"
+  local metric="$2"
+  local threshold="$3"
+  local minimum_epoch="${4:--1}"
+  local log_path="data/outputs/robomimic/${run_name}/logs.json.txt"
+  if [[ ! -f "${log_path}" ]]; then
+    echo 0
+    return
+  fi
+  python -c "import json, pathlib
+p=pathlib.Path('${log_path}')
+metric='${metric}'
+threshold=float('${threshold}')
+minimum_epoch=int('${minimum_epoch}')
+values_by_epoch={}
+for line in p.read_text(errors='ignore').splitlines():
+    try:
+        obj=json.loads(line)
+    except Exception:
+        continue
+    if metric in obj and 'epoch' in obj:
+        epoch=int(obj['epoch'])
+        if epoch >= minimum_epoch:
+            values_by_epoch[epoch]=float(obj[metric])
+count=0
+for _, value in sorted(values_by_epoch.items(), reverse=True):
+    if value >= threshold:
+        break
+    count += 1
+print(count)"
+}
+
 record_best_checkpoint() {
   local stage="$1"
   local run_name="$2"
@@ -501,14 +555,109 @@ threshold=float('${threshold}')
 print('yes' if (not math.isnan(score) and score >= threshold) else 'no')"
 }
 
-next_target_epoch() {
+stage_prerequisites_passed() {
+  local stage="$1"
+  local run_name="$2"
+  local grasp_score
+  local insert_score
+  case "${stage}" in
+    B_INSERT)
+      grasp_score="$(latest_score "${run_name}" "test/stage_grasp_rate")"
+      score_passed "${grasp_score}" "${B_MIN_GRASP_SCORE}"
+      ;;
+    C_FULL)
+      grasp_score="$(latest_score "${run_name}" "test/stage_grasp_rate")"
+      insert_score="$(latest_score "${run_name}" "test/stage_insert_rate")"
+      if [[ "$(score_passed "${grasp_score}" "${C_MIN_GRASP_SCORE}")" == "yes" \
+         && "$(score_passed "${insert_score}" "${C_MIN_INSERT_SCORE}")" == "yes" ]]; then
+        echo yes
+      else
+        echo no
+      fi
+      ;;
+    *)
+      echo yes
+      ;;
+  esac
+}
+
+enforce_b_grasp_guard() {
   local run_name="$1"
+  local metric_epoch="$2"
+  local source_epoch="$3"
+  local added_epochs
+  local grasp_score
+  local failure_count
+
+  if [[ "${metric_epoch}" -lt 0 ]]; then
+    return
+  fi
+  added_epochs=$((metric_epoch - source_epoch))
+  if [[ "${added_epochs}" -lt "${B_GRASP_GUARD_ADDED_EPOCHS}" ]]; then
+    return
+  fi
+
+  grasp_score="$(latest_score "${run_name}" "test/stage_grasp_rate")"
+  failure_count="$(consecutive_failures "${run_name}" "test/stage_grasp_rate" "${B_ABORT_GRASP_SCORE}" "$((source_epoch + B_GRASP_GUARD_ADDED_EPOCHS))")"
+  echo "[AUTO] B preservation guard: added_epochs=${added_epochs}, grasp=${grasp_score}, required>=${B_ABORT_GRASP_SCORE}, consecutive_failures=${failure_count}/${B_GUARD_REQUIRED_CONSECUTIVE}"
+  if [[ "${failure_count}" -ge "${B_GUARD_REQUIRED_CONSECUTIVE}" ]]; then
+    echo "[ERROR] B_INSERT is destroying the validated A grasp behavior." >&2
+    echo "[ERROR] Stop this B recipe and restart from the frozen A checkpoint." >&2
+    exit 11
+  fi
+}
+
+enforce_c_preservation_guard() {
+  local run_name="$1"
+  local metric_epoch="$2"
+  local source_epoch="$3"
+  local added_epochs
+  local grasp_score
+  local insert_score
+  local grasp_failure_count
+  local insert_failure_count
+
+  if [[ "${metric_epoch}" -lt 0 ]]; then
+    return
+  fi
+  added_epochs=$((metric_epoch - source_epoch))
+  if [[ "${added_epochs}" -lt "${C_PRESERVATION_GUARD_ADDED_EPOCHS}" ]]; then
+    return
+  fi
+
+  grasp_score="$(latest_score "${run_name}" "test/stage_grasp_rate")"
+  insert_score="$(latest_score "${run_name}" "test/stage_insert_rate")"
+  grasp_failure_count="$(consecutive_failures "${run_name}" "test/stage_grasp_rate" "${C_ABORT_GRASP_SCORE}" "$((source_epoch + C_PRESERVATION_GUARD_ADDED_EPOCHS))")"
+  insert_failure_count="$(consecutive_failures "${run_name}" "test/stage_insert_rate" "${C_ABORT_INSERT_SCORE}" "$((source_epoch + C_PRESERVATION_GUARD_ADDED_EPOCHS))")"
+  echo "[AUTO] C preservation guard: added_epochs=${added_epochs}, grasp=${grasp_score}, insert=${insert_score}, required>=${C_ABORT_GRASP_SCORE}/${C_ABORT_INSERT_SCORE}, consecutive_failures=${grasp_failure_count}/${insert_failure_count}, limit=${C_GUARD_REQUIRED_CONSECUTIVE}"
+  if [[ "${grasp_failure_count}" -ge "${C_GUARD_REQUIRED_CONSECUTIVE}" \
+     || "${insert_failure_count}" -ge "${C_GUARD_REQUIRED_CONSECUTIVE}" ]]; then
+    echo "[ERROR] C_FULL is destroying validated A/B behavior." >&2
+    echo "[ERROR] Stop this C recipe and restart from the frozen B checkpoint." >&2
+    exit 12
+  fi
+}
+
+next_target_epoch() {
+  local stage="$1"
+  local run_name="$2"
   local cur
+  local chunk
+  local every
   cur="$(current_epoch "${run_name}")"
+  chunk="${CHUNK_EPOCHS}"
+  every="${ROLLOUT_EVERY}"
+  if [[ "${stage}" == "B_INSERT" ]]; then
+    chunk="${B_CHUNK_EPOCHS}"
+    every="${B_ROLLOUT_EVERY}"
+  elif [[ "${stage}" == "C_FULL" ]]; then
+    chunk="${C_CHUNK_EPOCHS}"
+    every="${C_ROLLOUT_EVERY}"
+  fi
   python -c "cur=int('${cur}')
-chunk=int('${CHUNK_EPOCHS}')
+chunk=int('${chunk}')
 first=int('${FIRST_EVAL_EPOCH}') + 1
-every=int('${ROLLOUT_EVERY}')
+every=int('${every}')
 desired=max(cur + chunk, first)
 # num_epochs is exclusive. Round the final trained epoch up to a rollout
 # boundary so every chunk finishes with a fresh simulator metric.
@@ -582,17 +731,20 @@ run_stage_chunk() {
       ;;
 
     B_INSERT)
-      # B v5 learns stable frame assembly while keeping the grasp. Release is
-      # deliberately deferred to C; otherwise the insert stage learns to drop
-      # the frame near the stand before it is seated.
-      echo "[AUTO] B recipe=insert_only_v5 lr=1e-5 action_steps=4 release=false metric=stage_insert_rate"
+      # B v6 keeps the validated A checkpoint recipe unchanged and concentrates
+      # transfer capacity on the release-anchored insertion approach. Release is
+      # still deferred to C: B must first hold a valid assembled geometry.
+      # The model horizon stays at 16 for A-checkpoint compatibility. Dataset
+      # oversampling covers all 48 approach steps across multiple chunks, while
+      # the event-local phase window covers 15 steps inside its release chunk.
+      echo "[AUTO] B recipe=insert_focus_v9_4_2_continuous50 lr=1e-6 proximal_rate=2e-5 chunk=50 action_steps=4 release=false metric=stage_insert_rate"
       RUN_NAME="${run_name}" \
       NUM_EPOCHS="${target_epoch}" \
       LR_SCHEDULER_NUM_EPOCHS="${MAX_STAGE_EPOCHS}" \
       LR_SCHEDULER_START_EPOCH="${scheduler_start_epoch}" \
       ROLLOUT_START_EPOCH="${FIRST_EVAL_EPOCH}" \
-      ROLLOUT_EVERY="${ROLLOUT_EVERY}" \
-      CHECKPOINT_EVERY="${CHECKPOINT_EVERY}" \
+      ROLLOUT_EVERY="${B_ROLLOUT_EVERY}" \
+      CHECKPOINT_EVERY="${B_CHECKPOINT_EVERY}" \
       N_ENVS="${N_ENVS}" \
       TRAINING_RESUME="${resume_mode}" \
       RESUME_FROM_PATH="${resume_path:-null}" \
@@ -600,32 +752,42 @@ run_stage_chunk() {
       GRIPPER_CLOSE_IS_GREATER="${GRIPPER_CLOSE_IS_GREATER:-auto}" \
       ROLLOUT_BEFORE_TRAINING=true \
       FREEZE_ENCODER_UNTIL_EPOCH="${B_FREEZE_ENCODER_UNTIL_EPOCH:-null}" \
-      TRAIN_LR="${B_TRAIN_LR:-0.00001}" \
+      PARAMETER_ANCHOR_PATH="${A_CKPT}" \
+      PARAMETER_ANCHOR_RATE="${B_PARAMETER_ANCHOR_RATE:-0.00002}" \
+      TRAIN_LR="${B_TRAIN_LR:-0.000001}" \
       N_ACTION_STEPS="${B_N_ACTION_STEPS:-4}" \
       HISTORY_SHIFT="${B_HISTORY_SHIFT:-4}" \
-      PHASE_LOSS_WEIGHT="${B_PHASE_LOSS_WEIGHT:-0.012}" \
+      ACTION_CLIP_BY_DATASET=true \
+      ACTION_CLIP_MARGIN_SCALE="${B_ACTION_CLIP_MARGIN_SCALE:-0.10}" \
+      ACTION_CLIP_MIN_MARGIN="${B_ACTION_CLIP_MIN_MARGIN:-0.02}" \
+      PHASE_LOSS_WEIGHT="${B_PHASE_LOSS_WEIGHT:-0.005}" \
       TRANSLATION_WEIGHT="${B_TRANSLATION_WEIGHT:-1.6}" \
-      ROTATION_WEIGHT="${B_ROTATION_WEIGHT:-0.8}" \
-      GRIPPER_WEIGHT="${B_GRIPPER_WEIGHT:-3.6}" \
+      ROTATION_WEIGHT="${B_ROTATION_WEIGHT:-1.0}" \
+      GRIPPER_WEIGHT="${B_GRIPPER_WEIGHT:-3.0}" \
       GRIPPER_TIMING_ENABLED=true \
-      MIN_CLOSE_STEPS="${B_MIN_CLOSE_STEPS:-12}" \
-      MAX_LATCH_CHUNKS_AFTER_CLOSE="${B_MAX_LATCH_CHUNKS_AFTER_CLOSE:-20}" \
+      MIN_CLOSE_STEPS="${B_MIN_CLOSE_STEPS:-16}" \
+      MAX_LATCH_CHUNKS_AFTER_CLOSE="${B_MAX_LATCH_CHUNKS_AFTER_CLOSE:-40}" \
       PICK_WINDOW_BEFORE="${B_PICK_WINDOW_BEFORE:-8}" \
-      PICK_WINDOW_AFTER="${B_PICK_WINDOW_AFTER:-24}" \
-      PICK_WINDOW_TRANSLATION_WEIGHT="${B_PICK_WINDOW_TRANSLATION_WEIGHT:-3.0}" \
+      PICK_WINDOW_AFTER="${B_PICK_WINDOW_AFTER:-16}" \
+      PICK_WINDOW_TRANSLATION_WEIGHT="${B_PICK_WINDOW_TRANSLATION_WEIGHT:-2.5}" \
       PICK_WINDOW_ROTATION_WEIGHT="${B_PICK_WINDOW_ROTATION_WEIGHT:-0.35}" \
-      PICK_WINDOW_GRIPPER_WEIGHT="${B_PICK_WINDOW_GRIPPER_WEIGHT:-4.8}" \
+      PICK_WINDOW_GRIPPER_WEIGHT="${B_PICK_WINDOW_GRIPPER_WEIGHT:-4.0}" \
       EPISODE_PREFIX_ENABLED=true \
       EPISODE_PREFIX_ANCHOR=first_release \
       EPISODE_PREFIX_AFTER="${B_EPISODE_PREFIX_AFTER:-24}" \
       EPISODE_PREFIX_MIN_STEPS="${B_EPISODE_PREFIX_MIN_STEPS:-180}" \
-      EPISODE_PREFIX_MAX_STEPS="${B_EPISODE_PREFIX_MAX_STEPS:-320}" \
+      EPISODE_PREFIX_MAX_STEPS="${B_EPISODE_PREFIX_MAX_STEPS:-null}" \
+      ANCHOR_OVERSAMPLE_ENABLED=true \
+      ANCHOR_OVERSAMPLE_BEFORE="${B_ANCHOR_OVERSAMPLE_BEFORE:-48}" \
+      ANCHOR_OVERSAMPLE_AFTER="${B_ANCHOR_OVERSAMPLE_AFTER:-8}" \
+      ANCHOR_OVERSAMPLE_REPEATS="${B_ANCHOR_OVERSAMPLE_REPEATS:-2}" \
       HANG_WINDOW_ANCHOR=release \
       HANG_WINDOW_OCCURRENCE=first \
-      HANG_WINDOW_BEFORE="${B_HANG_WINDOW_BEFORE:-40}" \
+      HANG_WINDOW_ENABLED=true \
+      HANG_WINDOW_BEFORE="${B_HANG_WINDOW_BEFORE:-15}" \
       HANG_WINDOW_AFTER="${B_HANG_WINDOW_AFTER:-0}" \
-      HANG_WINDOW_TRANSLATION_WEIGHT="${B_HANG_WINDOW_TRANSLATION_WEIGHT:-3.2}" \
-      HANG_WINDOW_ROTATION_WEIGHT="${B_HANG_WINDOW_ROTATION_WEIGHT:-3.4}" \
+      HANG_WINDOW_TRANSLATION_WEIGHT="${B_HANG_WINDOW_TRANSLATION_WEIGHT:-2.5}" \
+      HANG_WINDOW_ROTATION_WEIGHT="${B_HANG_WINDOW_ROTATION_WEIGHT:-3.5}" \
       HANG_WINDOW_GRIPPER_WEIGHT="${B_HANG_WINDOW_GRIPPER_WEIGHT:-0.0}" \
       REGRASP_WINDOW_ENABLED=false \
       FINAL_RELEASE_WINDOW_ENABLED=false \
@@ -634,16 +796,27 @@ run_stage_chunk() {
       ;;
 
     C_FULL)
+      echo "[AUTO] C recipe=release_focus_v9_4_2_continuous50 lr=1e-6 proximal_rate=2e-5 chunk=50 preserve_A_B=true metric=stage_full_rate"
       RUN_NAME="${run_name}" \
       NUM_EPOCHS="${target_epoch}" \
       LR_SCHEDULER_NUM_EPOCHS="${MAX_STAGE_EPOCHS}" \
       LR_SCHEDULER_START_EPOCH="${scheduler_start_epoch}" \
       ROLLOUT_START_EPOCH="${FIRST_EVAL_EPOCH}" \
-      ROLLOUT_EVERY="${ROLLOUT_EVERY}" \
-      CHECKPOINT_EVERY="${CHECKPOINT_EVERY}" \
+      ROLLOUT_EVERY="${C_ROLLOUT_EVERY}" \
+      CHECKPOINT_EVERY="${C_CHECKPOINT_EVERY}" \
       N_ENVS="${N_ENVS}" \
       TRAINING_RESUME="${resume_mode}" \
       RESUME_FROM_PATH="${resume_path:-null}" \
+      ROLLOUT_BEFORE_TRAINING=true \
+      FREEZE_ENCODER_UNTIL_EPOCH="${C_FREEZE_ENCODER_UNTIL_EPOCH:-null}" \
+      PARAMETER_ANCHOR_PATH="${B_CKPT}" \
+      PARAMETER_ANCHOR_RATE="${C_PARAMETER_ANCHOR_RATE:-0.00002}" \
+      TRAIN_LR="${C_TRAIN_LR:-0.000001}" \
+      N_ACTION_STEPS="${C_N_ACTION_STEPS:-4}" \
+      HISTORY_SHIFT="${C_HISTORY_SHIFT:-4}" \
+      ACTION_CLIP_BY_DATASET=true \
+      ACTION_CLIP_MARGIN_SCALE="${C_ACTION_CLIP_MARGIN_SCALE:-0.10}" \
+      ACTION_CLIP_MIN_MARGIN="${C_ACTION_CLIP_MIN_MARGIN:-0.02}" \
       PHASE_LOSS_WEIGHT="${C_PHASE_LOSS_WEIGHT:-0.0025}" \
       TRANSLATION_WEIGHT="${C_TRANSLATION_WEIGHT:-1.6}" \
       ROTATION_WEIGHT="${C_ROTATION_WEIGHT:-0.95}" \
@@ -689,6 +862,7 @@ run_until_pass() {
   local metric
   local metric_epoch=-1
   local expected_metric_epoch=-1
+  local checkpoint_metric_epoch=-1
   local minimum_epoch=0
   local maximum_epoch=0
   local pass_count=0
@@ -700,6 +874,11 @@ run_until_pass() {
   local best_epoch=-1
   local plateau_evals=0
   local scheduler_start_epoch=0
+  local prerequisites_passed=no
+  local stage_chunk_epochs=0
+  local stage_rollout_every=0
+  local source_epoch=0
+  local source_target=0
 
   run_name="$(stage_run_name "${stage}")"
   threshold="$(stage_pass_score "${stage}")"
@@ -742,9 +921,15 @@ run_until_pass() {
     cur="$(current_epoch "${run_name}")"
     score="$(latest_score "${run_name}" "${metric}")"
     passed="$(score_passed "${score}" "${threshold}")"
+    prerequisites_passed="$(stage_prerequisites_passed "${stage}" "${run_name}")"
     pass_count="$(consecutive_passes "${run_name}" "${metric}" "${threshold}")"
     ckpt="$(latest_ckpt "${run_name}")"
     metric_epoch="$(latest_metric_epoch "${run_name}" "${metric}")"
+    if [[ "${stage}" == "B_INSERT" ]]; then
+      enforce_b_grasp_guard "${run_name}" "${metric_epoch}" "${source_epoch}"
+    elif [[ "${stage}" == "C_FULL" ]]; then
+      enforce_c_preservation_guard "${run_name}" "${metric_epoch}" "${source_epoch}"
+    fi
     record_best_checkpoint "${stage}" "${run_name}" "${metric}" "${score}" "${metric_epoch}"
     if [[ "${stage}" == "A_HOLD" && "${a_finetune_active}" != "true" ]]; then
       restore_historical_best_checkpoint "${stage}" "${run_name}" "${metric}"
@@ -771,7 +956,7 @@ run_until_pass() {
         fi
       fi
     fi
-    if [[ "${passed}" == "yes" && "${cur}" -ge "${minimum_epoch}" && "${pass_count}" -ge "${required_passes}" && -n "${ckpt}" ]]; then
+    if [[ "${passed}" == "yes" && "${prerequisites_passed}" == "yes" && "${cur}" -ge "${minimum_epoch}" && "${pass_count}" -ge "${required_passes}" && -n "${ckpt}" ]]; then
       echo "[AUTO] ${stage} gate was already passed: ${metric}=${score}, epoch=${cur}, consecutive=${pass_count}."
       PASSED_CKPT="${BEST_CKPT:-${ckpt}}"
       echo "[AUTO] ${stage} transfer checkpoint: ${PASSED_CKPT}"
@@ -805,12 +990,18 @@ run_until_pass() {
       resume_path=null
     fi
 
-    target="$(next_target_epoch "${run_name}")"
+    target="$(next_target_epoch "${stage}" "${run_name}")"
     if [[ -z "${ckpt}" && -n "${init_resume_path}" ]]; then
       source_epoch="$(checkpoint_epoch "${init_resume_path}")"
+      stage_chunk_epochs="${CHUNK_EPOCHS}"
+      if [[ "${stage}" == "B_INSERT" ]]; then
+        stage_chunk_epochs="${B_CHUNK_EPOCHS}"
+      elif [[ "${stage}" == "C_FULL" ]]; then
+        stage_chunk_epochs="${C_CHUNK_EPOCHS}"
+      fi
       # The checkpoint epoch is inclusive while num_epochs is exclusive.
-      # +1 makes the transfer chunk end on source_epoch + CHUNK_EPOCHS.
-      source_target=$((source_epoch + CHUNK_EPOCHS + 1))
+      # +1 makes the transfer chunk end on source_epoch + stage chunk.
+      source_target=$((source_epoch + stage_chunk_epochs + 1))
       if [[ "${target}" -lt "${source_target}" ]]; then
         echo "[AUTO] transfer checkpoint epoch=${source_epoch}; raising target_epoch from ${target} to ${source_target}"
         target="${source_target}"
@@ -826,12 +1017,19 @@ run_until_pass() {
       "${scheduler_start_epoch}"
 
     score="$(latest_score "${run_name}" "${metric}")"
+    prerequisites_passed="$(stage_prerequisites_passed "${stage}" "${run_name}")"
     cur="$(current_epoch "${run_name}")"
     metric_epoch="$(latest_metric_epoch "${run_name}" "${metric}")"
     # Rollout is scheduled only on multiples of ROLLOUT_EVERY. A chunk may be
     # capped at a non-rollout epoch, so compare against the latest epoch where
     # rollout was actually due, not blindly against cur - 1.
-    expected_metric_epoch=$(( ((cur - 1) / ROLLOUT_EVERY) * ROLLOUT_EVERY ))
+    stage_rollout_every="${ROLLOUT_EVERY}"
+    if [[ "${stage}" == "B_INSERT" ]]; then
+      stage_rollout_every="${B_ROLLOUT_EVERY}"
+    elif [[ "${stage}" == "C_FULL" ]]; then
+      stage_rollout_every="${C_ROLLOUT_EVERY}"
+    fi
+    expected_metric_epoch=$(( ((cur - 1) / stage_rollout_every) * stage_rollout_every ))
     if [[ "${score}" == "nan" ]]; then
       echo "[ERROR] ${stage} completed a training chunk but '${metric}' was never logged." >&2
       echo "[ERROR] This is an eval/code-bundle failure, not a zero success rate." >&2
@@ -842,6 +1040,26 @@ run_until_pass() {
       echo "[ERROR] ${stage} latest metric is stale: metric_epoch=${metric_epoch}, expected=${expected_metric_epoch}." >&2
       echo "[ERROR] The current rollout failed or was skipped; refusing to train or switch stages using an older score." >&2
       exit 5
+    fi
+    if [[ "${stage}" == "B_INSERT" || "${stage}" == "C_FULL" ]]; then
+      ckpt="$(latest_ckpt "${run_name}")"
+      if [[ -z "${ckpt}" ]]; then
+        echo "[ERROR] ${stage} completed epoch=${metric_epoch} without a resumable checkpoint." >&2
+        echo "[ERROR] Refusing to restart from the previous stage and repeat training." >&2
+        exit 13
+      fi
+      checkpoint_metric_epoch="$(checkpoint_epoch "${ckpt}")"
+      if [[ "${checkpoint_metric_epoch}" -ne "${metric_epoch}" ]]; then
+        echo "[ERROR] ${stage} checkpoint is stale: checkpoint_epoch=${checkpoint_metric_epoch}, metric_epoch=${metric_epoch}." >&2
+        echo "[ERROR] Every curriculum chunk must continue from the chunk immediately before it." >&2
+        exit 13
+      fi
+      echo "[AUTO] ${stage} continuation verified: checkpoint_epoch=${checkpoint_metric_epoch} -> next chunk"
+    fi
+    if [[ "${stage}" == "B_INSERT" ]]; then
+      enforce_b_grasp_guard "${run_name}" "${metric_epoch}" "${source_epoch}"
+    elif [[ "${stage}" == "C_FULL" ]]; then
+      enforce_c_preservation_guard "${run_name}" "${metric_epoch}" "${source_epoch}"
     fi
     passed="$(score_passed "${score}" "${threshold}")"
     pass_count="$(consecutive_passes "${run_name}" "${metric}" "${threshold}")"
@@ -879,7 +1097,7 @@ run_until_pass() {
       fi
     fi
 
-    if [[ "${passed}" == "yes" && "${cur}" -ge "${minimum_epoch}" && "${pass_count}" -ge "${required_passes}" ]]; then
+    if [[ "${passed}" == "yes" && "${prerequisites_passed}" == "yes" && "${cur}" -ge "${minimum_epoch}" && "${pass_count}" -ge "${required_passes}" ]]; then
       ckpt="$(latest_ckpt "${run_name}")"
       if [[ -z "${ckpt}" ]]; then
         echo "[ERROR] ${stage} passed but latest checkpoint is missing for ${run_name}." >&2
@@ -922,8 +1140,12 @@ echo
 echo "[AUTO] A simulator grasp rate passed automatically; continuing to B_INSERT."
 
 if [[ -z "${B_FREEZE_ENCODER_UNTIL_EPOCH:-}" ]]; then
-  A_SOURCE_EPOCH="$(checkpoint_epoch "${A_CKPT}")"
-  B_FREEZE_ENCODER_UNTIL_EPOCH=$((A_SOURCE_EPOCH + B_FREEZE_ENCODER_ADDED_EPOCHS))
+  if [[ "${B_FREEZE_ENCODER_ADDED_EPOCHS}" -gt 0 ]]; then
+    A_SOURCE_EPOCH="$(checkpoint_epoch "${A_CKPT}")"
+    B_FREEZE_ENCODER_UNTIL_EPOCH=$((A_SOURCE_EPOCH + B_FREEZE_ENCODER_ADDED_EPOCHS))
+  else
+    B_FREEZE_ENCODER_UNTIL_EPOCH=null
+  fi
 fi
 echo "[AUTO] B encoder freeze boundary: epoch=${B_FREEZE_ENCODER_UNTIL_EPOCH}"
 
@@ -941,6 +1163,16 @@ fi
 echo
 echo "[AUTO] ALLOW_STAGE_C=true; continuing from confirmed B checkpoint."
 
+
+if [[ -z "${C_FREEZE_ENCODER_UNTIL_EPOCH:-}" ]]; then
+  if [[ "${C_FREEZE_ENCODER_ADDED_EPOCHS}" -gt 0 ]]; then
+    B_SOURCE_EPOCH="$(checkpoint_epoch "${B_CKPT}")"
+    C_FREEZE_ENCODER_UNTIL_EPOCH=$((B_SOURCE_EPOCH + C_FREEZE_ENCODER_ADDED_EPOCHS))
+  else
+    C_FREEZE_ENCODER_UNTIL_EPOCH=null
+  fi
+fi
+echo "[AUTO] C encoder freeze boundary: epoch=${C_FREEZE_ENCODER_UNTIL_EPOCH}"
 
 PASSED_CKPT=""
 run_until_pass C_FULL "${B_CKPT}"

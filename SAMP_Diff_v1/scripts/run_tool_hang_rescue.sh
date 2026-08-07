@@ -262,6 +262,16 @@ elif [[ "${variant}" == "FLOW" ]]; then
   hang_window_enabled=true
 fi
 
+# Allow staged callers to enable the same guidance windows and timing guard
+# without switching the underlying policy recipe between stages.
+pick_window_enabled="${PICK_WINDOW_ENABLED:-${pick_window_enabled}}"
+hang_window_enabled="${HANG_WINDOW_ENABLED:-${hang_window_enabled}}"
+gripper_timing_enabled="${GRIPPER_TIMING_ENABLED:-${gripper_timing_enabled:-false}}"
+min_close_steps="${MIN_CLOSE_STEPS:-${min_close_steps:-2}}"
+max_latch_chunks_after_close="${MAX_LATCH_CHUNKS_AFTER_CLOSE:-${max_latch_chunks_after_close:-null}}"
+regrasp_window_enabled="${REGRASP_WINDOW_ENABLED:-${regrasp_window_enabled:-false}}"
+final_release_window_enabled="${FINAL_RELEASE_WINDOW_ENABLED:-${final_release_window_enabled:-false}}"
+
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
@@ -281,6 +291,8 @@ python train.py --config-name=tool_hang_ph \
   "++training.rollout_start_epoch=${rollout_start_epoch:-0}" \
   "++training.rollout_before_training=${ROLLOUT_BEFORE_TRAINING:-false}" \
   "++training.freeze_encoder_until_epoch=${FREEZE_ENCODER_UNTIL_EPOCH:-null}" \
+  "++training.parameter_anchor_path=${PARAMETER_ANCHOR_PATH:-null}" \
+  "++training.parameter_anchor_rate=${PARAMETER_ANCHOR_RATE:-0.0}" \
   "training.checkpoint_every=${checkpoint_every}" \
   "++task.dataset.episode_prefix_enabled=${EPISODE_PREFIX_ENABLED:-${episode_prefix_enabled:-false}}" \
   "++task.dataset.episode_prefix_anchor=${EPISODE_PREFIX_ANCHOR:-first_close}" \
@@ -289,6 +301,10 @@ python train.py --config-name=tool_hang_ph \
   "++task.dataset.episode_prefix_after=${EPISODE_PREFIX_AFTER:-${episode_prefix_after:-48}}" \
   "++task.dataset.episode_prefix_min_steps=${EPISODE_PREFIX_MIN_STEPS:-${episode_prefix_min_steps:-80}}" \
   "++task.dataset.episode_prefix_max_steps=${EPISODE_PREFIX_MAX_STEPS:-${episode_prefix_max_steps:-160}}" \
+  "++task.dataset.anchor_oversample_enabled=${ANCHOR_OVERSAMPLE_ENABLED:-false}" \
+  "++task.dataset.anchor_oversample_before=${ANCHOR_OVERSAMPLE_BEFORE:-48}" \
+  "++task.dataset.anchor_oversample_after=${ANCHOR_OVERSAMPLE_AFTER:-8}" \
+  "++task.dataset.anchor_oversample_repeats=${ANCHOR_OVERSAMPLE_REPEATS:-1}" \
   dataloader.persistent_workers=true \
   val_dataloader.persistent_workers=true \
   "n_action_steps=${n_action_steps}" \

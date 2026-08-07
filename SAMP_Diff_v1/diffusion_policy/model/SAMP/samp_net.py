@@ -358,14 +358,27 @@ class SampNet(nn.Module):
         gripper = actions_gt.index_select(
             -1,
             torch.as_tensor(gripper_indices, device=device),
-        ).mean(dim=-1)
+        )
         if close_is_greater:
-            close = gripper >= close_threshold
+            close_by_gripper = gripper >= close_threshold
         else:
-            close = gripper <= close_threshold
+            close_by_gripper = gripper <= close_threshold
 
-        prev_close = close.clone()
-        prev_close[:, 1:] = close[:, :-1]
+        # Detect each gripper transition before reducing across grippers.
+        # Averaging dual-arm commands can cancel an asynchronous close and
+        # silently remove the GC supervision from Transport.
+        prev_close_by_gripper = close_by_gripper.clone()
+        prev_close_by_gripper[:, 1:] = close_by_gripper[:, :-1]
+        raw_close_transition_by_gripper = (
+            close_by_gripper & (~prev_close_by_gripper)
+        )
+        raw_release_transition_by_gripper = (
+            (~close_by_gripper) & prev_close_by_gripper
+        )
+        raw_close_transition = raw_close_transition_by_gripper.any(dim=-1)
+        raw_release_transition = raw_release_transition_by_gripper.any(dim=-1)
+
+        close = close_by_gripper.any(dim=-1)
 
         def expand_transition(transition, radius):
             radius = max(0, int(radius))
@@ -377,8 +390,8 @@ class SampNet(nn.Module):
                 expanded[:, :-offset] = expanded[:, :-offset] | transition[:, offset:]
             return expanded
 
-        close_transition = close & (~prev_close)
-        close_transition = expand_transition(close_transition, transition_radius)
+        close_transition = expand_transition(
+            raw_close_transition, transition_radius)
 
         release_enabled = bool(cfg.get('release_enabled', False))
         release_transition = None
@@ -387,8 +400,8 @@ class SampNet(nn.Module):
                 0,
                 int(cfg.get('release_transition_radius', transition_radius)),
             )
-            release_transition = (~close) & prev_close
-            release_transition = expand_transition(release_transition, release_radius)
+            release_transition = expand_transition(
+                raw_release_transition, release_radius)
 
         weight = torch.zeros_like(actions_gt)
 
@@ -416,47 +429,250 @@ class SampNet(nn.Module):
                 current + update,
             )
 
-        if close_transition.any():
-            add_group(
-                close_transition,
-                cfg.get('translation_indices', [0, 1, 2]),
-                cfg.get('translation_weight', 1.0),
+        # A dual-arm task must not broadcast one arm's gripper transition to
+        # the other arm.  When per_gripper_groups is configured, each gripper
+        # event supervises only its own arm's semantic action dimensions.
+        per_gripper_groups = cfg.get('per_gripper_groups', None)
+        if per_gripper_groups:
+            coordinate_motion = bool(
+                cfg.get('coordinate_motion_on_any_transition', False)
             )
-            add_group(
-                close_transition,
-                cfg.get('rotation_indices', [3, 4, 5, 6, 7, 8]),
-                cfg.get('rotation_weight', 1.0),
-            )
-            add_group(close_transition, gripper_indices, cfg.get('gripper_weight', 1.0))
-
-        if release_enabled and release_transition is not None and release_transition.any():
-            add_group(
-                release_transition,
-                cfg.get(
-                    'release_translation_indices',
-                    cfg.get('translation_indices', [0, 1, 2]),
-                ),
-                cfg.get(
-                    'release_translation_weight',
+            if coordinate_motion:
+                # Preserve bimanual coordination at a grasp event: both arms'
+                # poses are supervised together, while gripper commands remain
+                # isolated below. This retains the stable Transport behaviour
+                # of the original phase loss without coupling the two grippers.
+                add_group(
+                    close_transition,
+                    cfg.get('translation_indices', []),
                     cfg.get('translation_weight', 1.0),
-                ),
-            )
-            add_group(
-                release_transition,
-                cfg.get(
-                    'release_rotation_indices',
-                    cfg.get('rotation_indices', [3, 4, 5, 6, 7, 8]),
-                ),
-                cfg.get(
-                    'release_rotation_weight',
+                )
+                add_group(
+                    close_transition,
+                    cfg.get('rotation_indices', []),
                     cfg.get('rotation_weight', 1.0),
-                ),
-            )
-            add_group(
-                release_transition,
-                gripper_indices,
-                cfg.get('release_gripper_weight', cfg.get('gripper_weight', 1.0)),
-            )
+                )
+                if (release_enabled and release_transition is not None
+                        and release_transition.any()):
+                    add_group(
+                        release_transition,
+                        cfg.get(
+                            'release_translation_indices',
+                            cfg.get('translation_indices', []),
+                        ),
+                        cfg.get(
+                            'release_translation_weight',
+                            cfg.get('translation_weight', 1.0),
+                        ),
+                    )
+                    add_group(
+                        release_transition,
+                        cfg.get(
+                            'release_rotation_indices',
+                            cfg.get('rotation_indices', []),
+                        ),
+                        cfg.get(
+                            'release_rotation_weight',
+                            cfg.get('rotation_weight', 1.0),
+                        ),
+                    )
+            gripper_column = {
+                action_index: column
+                for column, action_index in enumerate(gripper_indices)
+            }
+            for group_name, raw_group_cfg in per_gripper_groups.items():
+                group_cfg = dict(raw_group_cfg)
+                gripper_index = int(group_cfg['gripper_index'])
+                if gripper_index not in gripper_column:
+                    raise ValueError(
+                        "action_phase_loss per_gripper_groups."
+                        f"{group_name}.gripper_index={gripper_index} is not "
+                        f"present in gripper_indices={gripper_indices}"
+                    )
+                column = gripper_column[gripper_index]
+                arm_close_transition = expand_transition(
+                    raw_close_transition_by_gripper[:, :, column],
+                    transition_radius,
+                )
+                if not coordinate_motion:
+                    add_group(
+                        arm_close_transition,
+                        group_cfg.get('translation_indices', []),
+                        group_cfg.get(
+                            'translation_weight',
+                            cfg.get('translation_weight', 1.0),
+                        ),
+                    )
+                    add_group(
+                        arm_close_transition,
+                        group_cfg.get('rotation_indices', []),
+                        group_cfg.get(
+                            'rotation_weight',
+                            cfg.get('rotation_weight', 1.0),
+                        ),
+                    )
+                add_group(
+                    arm_close_transition,
+                    [gripper_index],
+                    group_cfg.get(
+                        'gripper_weight', cfg.get('gripper_weight', 1.0)),
+                )
+
+                # A transition-only objective teaches *when* to close, but it
+                # does not give extra supervision to the long interval after
+                # contact.  This is especially harmful in Transport: either
+                # arm may touch the correct object and then reopen while its
+                # pose trajectory continues.  Keep this opt-in and per-arm so
+                # one gripper's hold state can never supervise the other.
+                arm_closed = close_by_gripper[:, :, column]
+                add_group(
+                    arm_closed,
+                    [gripper_index],
+                    group_cfg.get('closed_hold_gripper_weight', 0.0),
+                )
+                add_group(
+                    arm_closed,
+                    group_cfg.get('translation_indices', []),
+                    group_cfg.get('closed_hold_translation_weight', 0.0),
+                )
+                add_group(
+                    arm_closed,
+                    group_cfg.get('rotation_indices', []),
+                    group_cfg.get('closed_hold_rotation_weight', 0.0),
+                )
+
+                if release_enabled:
+                    release_radius = max(
+                        0,
+                        int(cfg.get(
+                            'release_transition_radius', transition_radius)),
+                    )
+                    arm_release_transition = expand_transition(
+                        raw_release_transition_by_gripper[:, :, column],
+                        release_radius,
+                    )
+                    if not coordinate_motion:
+                        add_group(
+                            arm_release_transition,
+                            group_cfg.get(
+                                'release_translation_indices',
+                                group_cfg.get('translation_indices', []),
+                            ),
+                            group_cfg.get(
+                                'release_translation_weight',
+                                cfg.get(
+                                    'release_translation_weight',
+                                    group_cfg.get(
+                                        'translation_weight',
+                                        cfg.get('translation_weight', 1.0),
+                                    ),
+                                ),
+                            ),
+                        )
+                        add_group(
+                            arm_release_transition,
+                            group_cfg.get(
+                                'release_rotation_indices',
+                                group_cfg.get('rotation_indices', []),
+                            ),
+                            group_cfg.get(
+                                'release_rotation_weight',
+                                cfg.get(
+                                    'release_rotation_weight',
+                                    group_cfg.get(
+                                        'rotation_weight',
+                                        cfg.get('rotation_weight', 1.0),
+                                    ),
+                                ),
+                            ),
+                        )
+                    add_group(
+                        arm_release_transition,
+                        [gripper_index],
+                        group_cfg.get(
+                            'release_gripper_weight',
+                            cfg.get(
+                                'release_gripper_weight',
+                                group_cfg.get(
+                                    'gripper_weight',
+                                    cfg.get('gripper_weight', 1.0),
+                                ),
+                            ),
+                        ),
+                    )
+
+            # During a handoff both grippers can be closed briefly.  Give that
+            # overlap its own small coordination objective without coupling
+            # ordinary single-arm grasps.  This is disabled unless explicitly
+            # configured by a dual-arm task recipe.
+            if (close_by_gripper.shape[-1] >= 2
+                    and bool(cfg.get('bimanual_hold_enabled', False))):
+                bimanual_hold = close_by_gripper.all(dim=-1)
+                add_group(
+                    bimanual_hold,
+                    cfg.get('translation_indices', []),
+                    cfg.get('bimanual_hold_translation_weight', 0.0),
+                )
+                add_group(
+                    bimanual_hold,
+                    cfg.get('rotation_indices', []),
+                    cfg.get('bimanual_hold_rotation_weight', 0.0),
+                )
+                add_group(
+                    bimanual_hold,
+                    gripper_indices,
+                    cfg.get('bimanual_hold_gripper_weight', 0.0),
+                )
+        else:
+            if close_transition.any():
+                add_group(
+                    close_transition,
+                    cfg.get('translation_indices', [0, 1, 2]),
+                    cfg.get('translation_weight', 1.0),
+                )
+                add_group(
+                    close_transition,
+                    cfg.get('rotation_indices', [3, 4, 5, 6, 7, 8]),
+                    cfg.get('rotation_weight', 1.0),
+                )
+                add_group(
+                    close_transition,
+                    gripper_indices,
+                    cfg.get('gripper_weight', 1.0),
+                )
+
+            if (release_enabled and release_transition is not None
+                    and release_transition.any()):
+                add_group(
+                    release_transition,
+                    cfg.get(
+                        'release_translation_indices',
+                        cfg.get('translation_indices', [0, 1, 2]),
+                    ),
+                    cfg.get(
+                        'release_translation_weight',
+                        cfg.get('translation_weight', 1.0),
+                    ),
+                )
+                add_group(
+                    release_transition,
+                    cfg.get(
+                        'release_rotation_indices',
+                        cfg.get('rotation_indices', [3, 4, 5, 6, 7, 8]),
+                    ),
+                    cfg.get(
+                        'release_rotation_weight',
+                        cfg.get('rotation_weight', 1.0),
+                    ),
+                )
+                add_group(
+                    release_transition,
+                    gripper_indices,
+                    cfg.get(
+                        'release_gripper_weight',
+                        cfg.get('gripper_weight', 1.0),
+                    ),
+                )
 
         extra_windows = cfg.get('extra_windows', None)
         if extra_windows:
@@ -501,9 +717,9 @@ class SampNet(nn.Module):
                 # phase and can otherwise teach the hang motion before grasp.
                 anchor = str(window_cfg.get('anchor', 'fixed')).lower()
                 if anchor in ('close', 'gripper_close'):
-                    anchor_event = close & (~prev_close)
+                    anchor_event = raw_close_transition
                 elif anchor in ('release', 'gripper_release'):
-                    anchor_event = (~close) & prev_close
+                    anchor_event = raw_release_transition
                 elif anchor in ('closed', 'gripper_closed', 'hold'):
                     anchor_event = close
                 elif anchor == 'fixed':

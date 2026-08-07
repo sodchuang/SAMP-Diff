@@ -18,7 +18,7 @@ FREQ_REPO="${FREQ_REPO:-../FreqPolicy}"
 TRAIN_ENTRY="${TRAIN_ENTRY:-train.py}"
 DEVICE="${DEVICE:-cuda:0}"
 TASKS="${TASKS:-pusht lift_ph can_ph square_ph tool_hang_ph transport_ph}"
-SEEDS="${SEEDS:-42}"
+SEEDS="${SEEDS:-42 43 44}"
 WANDB_MODE="${WANDB_MODE:-offline}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-data/outputs/samp_diff_baselines/freqpolicy}"
 CONFIG_DIR="${CONFIG_DIR:-config_task/low_dim}"
@@ -41,7 +41,7 @@ Environment overrides:
   CONFIG_DIR            Hydra config dir inside FREQ_REPO. Default: config_task/low_dim
   CONFIG_NAME_PATTERN   Config file pattern. Use {task}. Default: {task}.yaml
   TASKS                 Space-separated tasks. Default: pusht lift_ph can_ph square_ph tool_hang_ph transport_ph
-  SEEDS                 Space-separated seeds. Default: 42
+  SEEDS                 Space-separated seeds. Default: 42 43 44
   DEVICE                Training device. Default: cuda:0
   OUTPUT_ROOT           Output directory inside FREQ_REPO
   RUN_DEFAULT           Run FreqPolicy default setting. Default: true
