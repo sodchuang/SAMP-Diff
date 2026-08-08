@@ -1,6 +1,8 @@
 # Install after creating the conda env and installing torch.
-# Use: pip install --no-deps -r requirements_train_h100.txt
-# This file intentionally excludes MuJoCo, robosuite, dm-control, pytorch3d,
-# R3M, and pybullet. Add simulator extras only after train imports work.
-torchcfm
-torch-dct
+# Use: pip install -r requirements_train_h100.txt
+# Do not install this file with --no-deps: torchcfm / torchdyn need their
+# normal Python dependency tree. Only the legacy MuJoCo / robosuite simulator
+# stack should be isolated.
+torchcfm==1.0.7
+torchdyn==1.0.6
+torch-dct==0.1.6

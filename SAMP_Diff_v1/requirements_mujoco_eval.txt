@@ -1,5 +1,7 @@
-# Install this only when RoboMimic / robosuite evaluation is needed.
-# The system packages in VM_REBUILD_GUIDE.md must be installed first.
+# Reference list for the RoboMimic / robosuite evaluation stack.
+# Do not install this file directly with `pip install -r`: robosuite and
+# free-mujoco-py need isolated installation. Use instead:
+#   bash scripts/install_mujoco_robosuite_stack.sh
 free-mujoco-py==2.1.6
 robosuite @ https://github.com/cheng-chi/robosuite/archive/277ab9588ad7a4f4b55cf75508b44aa67ec171f0.tar.gz
 dm-control==1.0.9

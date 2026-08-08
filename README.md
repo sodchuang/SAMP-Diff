@@ -13,11 +13,17 @@ conda activate robodiff310
 
 # Install CUDA PyTorch first for the target VM, then:
 pip install -r requirements_runtime_h100.txt
-pip install --no-deps -r requirements_train_h100.txt
+pip install -r requirements_train_h100.txt
 pip install -e .
 ```
 
-Install simulator extras such as MuJoCo, robosuite, robomimic, and MimicGen after the base training import works on the VM.
+Do not use `--no-deps` for the base runtime or training requirements. Use dependency isolation only for the legacy MuJoCo / robosuite stack.
+
+For robomimic / MimicGen rollout evaluation, install simulator extras after the base training import works:
+
+```bash
+bash scripts/install_mujoco_robosuite_stack.sh
+```
 
 ## Data Layout
 

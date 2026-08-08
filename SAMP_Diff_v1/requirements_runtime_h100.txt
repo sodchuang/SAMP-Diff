@@ -33,11 +33,12 @@ threadpoolctl==3.1.0
 boto3==1.24.96
 accelerate==0.13.2
 diffusers==0.11.1
-# Install av later only if video decoding needs it. It requires pkg-config and
-# FFmpeg development headers on many Linux images.
-# av==10.0.0
+av==10.0.0
 ray[default,tune]==2.2.0
-robomimic==0.2.0
+# Keep simulator-facing packages out of the base runtime install. Install
+# robomimic / MuJoCo / robosuite only after train imports work; isolate only
+# the legacy MuJoCo / robosuite packages, not the whole environment.
+# robomimic==0.2.0
 imagecodecs==2022.9.26
 asciitree==0.3.3
 fasteners==0.19
