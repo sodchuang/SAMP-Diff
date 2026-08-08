@@ -9,6 +9,10 @@ git clone https://github.com/sodchuang/SAMP-Diff.git
 cd SAMP-Diff/SAMP_Diff_v1
 
 conda env create -f environment_h100_py310.yml
+
+# Initialize conda for the current shell, then enter the SAMP-Diff env.
+source ~/miniforge3/etc/profile.d/conda.sh
+conda init bash
 conda activate robodiff310
 
 # Install CUDA PyTorch first for the target VM, then:
@@ -23,6 +27,14 @@ For robomimic / MimicGen rollout evaluation, install simulator extras after the 
 
 ```bash
 bash scripts/install_mujoco_robosuite_stack.sh
+```
+
+For a fresh VM, the one-shot bootstrap also initializes conda and opens an
+interactive shell inside `robodiff310` at the end:
+
+```bash
+cd SAMP-Diff/SAMP_Diff_v1
+bash scripts/bootstrap_robodiff310_from_zero.sh
 ```
 
 ## Data Layout

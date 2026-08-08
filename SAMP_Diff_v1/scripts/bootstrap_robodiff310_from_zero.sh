@@ -226,6 +226,20 @@ python train.py --config-name=mimicgen_single --cfg job >/dev/null
 
 log "Environment is ready"
 printf '%s\n' \
-    "source ${MINIFORGE_HOME}/etc/profile.d/conda.sh" \
-    "conda activate ${ENV_NAME}" \
-    "cd ${PROJECT_ROOT}"
+    "Next shell commands:" \
+    "  source ${MINIFORGE_HOME}/etc/profile.d/conda.sh" \
+    "  conda activate ${ENV_NAME}" \
+    "  cd ${PROJECT_ROOT}"
+
+if [[ "${ENTER_ENV_SHELL:-1}" == "1" && -t 0 && -t 1 ]]; then
+    log "Opening an interactive shell inside ${ENV_NAME}"
+    rcfile="$(mktemp)"
+    {
+        printf 'source "%s/etc/profile.d/conda.sh"\n' "${MINIFORGE_HOME}"
+        printf 'conda activate "%s"\n' "${ENV_NAME}"
+        printf 'cd "%s"\n' "${PROJECT_ROOT}"
+        printf 'echo "[BOOTSTRAP] Active conda env: ${CONDA_DEFAULT_ENV}"\n'
+        printf 'echo "[BOOTSTRAP] Working directory: $(pwd)"\n'
+    } > "${rcfile}"
+    exec bash --rcfile "${rcfile}" -i
+fi
