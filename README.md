@@ -17,6 +17,8 @@ conda activate robodiff310
 
 # Install CUDA PyTorch first for the target VM, then:
 pip install -r requirements_runtime_h100.txt
+pip install Cython==0.29.36
+pip install --no-build-isolation av==10.0.0
 pip install -r requirements_train_h100.txt
 pip install -e .
 ```

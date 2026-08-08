@@ -33,7 +33,10 @@ threadpoolctl==3.1.0
 boto3==1.24.96
 accelerate==0.13.2
 diffusers==0.11.1
-av==10.0.0
+# Install PyAV separately after Cython is pinned:
+#   pip install --no-build-isolation av==10.0.0
+# Build isolation can pull Cython 3.x and fail while compiling av/logging.pyx.
+# av==10.0.0
 ray[default,tune]==2.2.0
 # Keep simulator-facing packages out of the base runtime install. Install
 # robomimic / MuJoCo / robosuite only after train imports work; isolate only

@@ -103,6 +103,12 @@ cd "${PROJECT_ROOT}"
 log "Installing pinned SAMP-Diff runtime packages"
 python -m pip install -r requirements_runtime_h100.txt
 
+# PyAV 10.0.0 is compatible with the project, but its isolated build env can
+# pull Cython 3.x and fail on noexcept signatures. Build it in the active env
+# after Cython is pinned.
+python -m pip install Cython==0.29.36
+python -m pip install --no-build-isolation av==10.0.0
+
 log "Installing pinned SAMP-Diff training packages"
 python -m pip install -r requirements_train_h100.txt
 python -m pip install \
