@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Stack_D1 parameter-modulated source prior for native delta_eef_pose actions.
+# xyz and rotation reuse shifted history with group-specific spectral noise;
+# gripper is regenerated for the discontinuous grasp/release decision.
+
+set -euo pipefail
+
+RUN_NAME="${RUN_NAME:-stack_delta_aligned_release_v5_seed42}"
+NUM_EPOCHS="${NUM_EPOCHS:-3000}"
+
+# Restore the Stack_D1 delta prior that previously produced successful
+# rollouts.  Excessively small translation noise locks rollout history onto an
+# early prediction and prevents observation-conditioned transport correction.
+# These remain environment-overridable for controlled ablations.
+TRANSLATION_SIGMA="${TRANSLATION_SIGMA:-0.24}"
+TRANSLATION_SIGMA_HIGH="${TRANSLATION_SIGMA_HIGH:-0.08}"
+# Repeat one narrow window around physically successful demonstrations.
+# In the dataset implementation repeats=2 means one additional copy, while
+# repeats=1 does not alter the sampler.
+PRE_RELEASE_TRANSLATION_WEIGHT="${PRE_RELEASE_TRANSLATION_WEIGHT:-4.5}"
+PRE_RELEASE_ROTATION_WEIGHT="${PRE_RELEASE_ROTATION_WEIGHT:-2.75}"
+SETTLE_TRANSLATION_WEIGHT="${SETTLE_TRANSLATION_WEIGHT:-4.0}"
+SETTLE_ROTATION_WEIGHT="${SETTLE_ROTATION_WEIGHT:-2.25}"
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+RUN_NAME="${RUN_NAME}" \
+NUM_EPOCHS="${NUM_EPOCHS}" \
+N_ACTION_STEPS=2 \
+INFERENCE_STEPS=8 \
+HISTORY_ENABLED=true \
+HISTORY_TRAINING_MODE=aligned \
+TRANSLATION_USE_HISTORY=true \
+TRANSLATION_HISTORY_UPDATE_RATE=1.0 \
+ROTATION_USE_HISTORY=true \
+ROTATION_HISTORY_UPDATE_RATE=1.0 \
+GRIPPER_USE_HISTORY=false \
+COLD_START_PROB=0.20 \
+TRANSLATION_FREQ_SPLIT_HIGH=8 \
+TRANSLATION_SIGMA="${TRANSLATION_SIGMA}" \
+TRANSLATION_SIGMA_HIGH="${TRANSLATION_SIGMA_HIGH}" \
+ROTATION_FREQ_SPLIT_HIGH=12 \
+ROTATION_SIGMA=0.12 \
+ROTATION_SIGMA_HIGH=0.06 \
+GRIPPER_FREQ_SPLIT_HIGH=16 \
+GRIPPER_SIGMA=0.35 \
+GRIPPER_SIGMA_HIGH=0.25 \
+TRANSLATION_LOSS_WEIGHT=1.80 \
+ROTATION_LOSS_WEIGHT=1.60 \
+BASE_GRIPPER_WEIGHT=2.00 \
+PHASE_LOSS_ENABLED=true \
+PHASE_LOSS_WEIGHT=0.03 \
+EVENT_OVERSAMPLE_ENABLED=true \
+STACK_EVENT_ANCHOR=last_release \
+STACK_RELEASE_GATE_ENABLED=true \
+STACK_RELEASE_MIN_ANCHOR_RATIO=0.80 \
+STACK_RELEASE_GATE_RADIUS=3 \
+EVENT_OVERSAMPLE_BEFORE=24 \
+EVENT_OVERSAMPLE_AFTER=12 \
+EVENT_OVERSAMPLE_REPEATS=2 \
+GRASP_HOLD_AFTER=16 \
+GRASP_HOLD_GRIPPER_WEIGHT=3.00 \
+PRE_RELEASE_TRANSLATION_WEIGHT="${PRE_RELEASE_TRANSLATION_WEIGHT}" \
+PRE_RELEASE_ROTATION_WEIGHT="${PRE_RELEASE_ROTATION_WEIGHT}" \
+SETTLE_TRANSLATION_WEIGHT="${SETTLE_TRANSLATION_WEIGHT}" \
+SETTLE_ROTATION_WEIGHT="${SETTLE_ROTATION_WEIGHT}" \
+RELEASE_GRIPPER_WEIGHT=4.00 \
+POST_RELEASE_TRANSLATION_WEIGHT=0.25 \
+POST_RELEASE_ROTATION_WEIGHT=0.15 \
+POST_RELEASE_GRIPPER_WEIGHT=5.00 \
+bash scripts/run_stack_delta_hg_gc_fix_from_scratch.sh

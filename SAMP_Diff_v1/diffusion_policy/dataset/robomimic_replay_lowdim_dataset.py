@@ -15,6 +15,7 @@ from diffusion_policy.common.normalize_util import (
     robomimic_abs_action_only_normalizer_from_stat,
     robomimic_abs_action_only_dual_arm_normalizer_from_stat,
     get_identity_normalizer_from_stat,
+    get_range_normalizer_from_stat,
     array_to_stats
 )
 
@@ -30,6 +31,8 @@ class RobomimicReplayLowdimDataset(BaseLowdimDataset):
                 'robot0_eef_quat', 
                 'robot0_gripper_qpos'],
             abs_action=False,
+            delta_action_normalizer='auto',
+            delta_action_identity_tolerance=0.05,
             rotation_rep='rotation_6d',
             use_legacy_normalizer=False,
             seed=42,
@@ -48,8 +51,41 @@ class RobomimicReplayLowdimDataset(BaseLowdimDataset):
             anchor_oversample_before=48,
             anchor_oversample_after=8,
             anchor_oversample_repeats=1,
+            event_oversample_enabled=False,
+            event_oversample_anchor='last_release',
+            event_oversample_before=24,
+            event_oversample_after=16,
+            event_oversample_repeats=1,
+            event_oversample_min_anchor_ratio=0.95,
+            event_oversample_observation_gate_enabled=False,
+            event_oversample_observation_gate_indices=None,
+            event_oversample_observation_gate_min=None,
+            event_oversample_observation_gate_max=None,
+            event_oversample_observation_gate_radius=0,
         ):
         obs_keys = list(obs_keys)
+        delta_action_normalizer = str(delta_action_normalizer).strip().lower()
+        if delta_action_normalizer not in ('auto', 'identity', 'limits'):
+            raise ValueError(
+                "delta_action_normalizer must be 'auto', 'identity', or "
+                f"'limits', got {delta_action_normalizer!r}")
+        delta_action_identity_tolerance = float(
+            delta_action_identity_tolerance)
+        if delta_action_identity_tolerance < 0:
+            raise ValueError(
+                "delta_action_identity_tolerance must be non-negative")
+        observation_gate = _prepare_observation_gate(
+            enabled=event_oversample_observation_gate_enabled,
+            indices=event_oversample_observation_gate_indices,
+            lower=event_oversample_observation_gate_min,
+            upper=event_oversample_observation_gate_max,
+        )
+        observation_gate_radius = int(
+            event_oversample_observation_gate_radius)
+        if observation_gate_radius < 0:
+            raise ValueError(
+                "event_oversample_observation_gate_radius must be "
+                "non-negative")
         rotation_transformer = RotationTransformer(
             from_rep='axis_angle', to_rep=rotation_rep)
 
@@ -65,6 +101,7 @@ class RobomimicReplayLowdimDataset(BaseLowdimDataset):
         replay_buffer = ReplayBuffer.create_empty_numpy()
         prefix_lengths = list()
         prefix_anchor_indices = list()
+        event_anchor_indices = list()
         full_stats = None
         if normalizer_use_full_dataset:
             full_stats = {'action': None, 'obs': None}
@@ -108,6 +145,27 @@ class RobomimicReplayLowdimDataset(BaseLowdimDataset):
                     obs_keys=obs_keys,
                     abs_action=abs_action,
                     rotation_transformer=rotation_transformer)
+                if event_oversample_enabled:
+                    if event_oversample_anchor in (
+                            'first_positive_reward',
+                            'last_positive_reward'):
+                        rewards = (
+                            demo['rewards'][:]
+                            if 'rewards' in demo else None)
+                        event_anchor_indices.append(
+                            _find_reward_anchor_index(
+                                rewards=rewards,
+                                anchor=event_oversample_anchor))
+                    else:
+                        event_anchor_indices.append(_find_action_anchor_index(
+                            actions=episode['action'],
+                            anchor=event_oversample_anchor,
+                            close_threshold=episode_prefix_close_threshold,
+                            close_is_greater=episode_prefix_close_is_greater,
+                            observations=episode['obs'],
+                            observation_gate=observation_gate,
+                            observation_gate_radius=observation_gate_radius,
+                        ))
                 if full_stats is not None:
                     for key in ('action', 'obs'):
                         full_stats[key] = _update_running_stats(
@@ -245,10 +303,100 @@ class RobomimicReplayLowdimDataset(BaseLowdimDataset):
                 f"focus_samples={len(focus_indices)}, "
                 f"total_samples={len(sampler.indices)}, "
                 f"usable_anchors={usable_anchors}")
+
+        # Generic event-centered sampling for complete tasks such as Stack.
+        # Unlike episode-prefix training, this keeps every demonstration in
+        # full and only repeats sequence windows that overlap the requested
+        # event. It therefore increases supervision around align -> release ->
+        # retreat without erasing reach, grasp, or transport examples.
+        if event_oversample_enabled:
+            repeats = int(event_oversample_repeats)
+            before = int(event_oversample_before)
+            after = int(event_oversample_after)
+            if repeats < 1:
+                raise ValueError(
+                    "event_oversample_repeats must be at least 1")
+            if before < 0 or after < 0:
+                raise ValueError(
+                    "event_oversample_before/after must be non-negative")
+            if len(event_anchor_indices) != replay_buffer.n_episodes:
+                raise RuntimeError(
+                    "event anchor count does not match loaded episodes")
+
+            found = sum(index is not None for index in event_anchor_indices)
+            anchor_ratio = found / max(1, len(event_anchor_indices))
+            if (
+                event_oversample_min_anchor_ratio is not None
+                and anchor_ratio < float(event_oversample_min_anchor_ratio)
+            ):
+                raise ValueError(
+                    "event oversampling anchor coverage is too low: "
+                    f"anchor={event_oversample_anchor}, "
+                    f"found={found}/{len(event_anchor_indices)} "
+                    f"({anchor_ratio:.3f}), required>="
+                    f"{float(event_oversample_min_anchor_ratio):.3f}")
+
+            episode_ends = replay_buffer.episode_ends[:]
+            episode_starts = np.concatenate(
+                [np.zeros(1, dtype=episode_ends.dtype), episode_ends[:-1]])
+            focus_mask = np.zeros(len(sampler.indices), dtype=bool)
+            buffer_starts = sampler.indices[:, 0]
+            buffer_ends = sampler.indices[:, 1]
+            usable_anchors = 0
+            anchor_steps = list()
+            for episode_idx, anchor_idx in enumerate(event_anchor_indices):
+                if anchor_idx is None or not train_mask[episode_idx]:
+                    continue
+                episode_length = int(
+                    episode_ends[episode_idx] - episode_starts[episode_idx])
+                if anchor_idx >= episode_length:
+                    continue
+                usable_anchors += 1
+                anchor_steps.append(int(anchor_idx))
+                global_anchor = (
+                    int(episode_starts[episode_idx]) + int(anchor_idx))
+                focus_start = max(
+                    int(episode_starts[episode_idx]),
+                    global_anchor - before)
+                focus_end = min(
+                    int(episode_ends[episode_idx]),
+                    global_anchor + after + 1)
+                focus_mask |= (
+                    (buffer_ends > focus_start)
+                    & (buffer_starts < focus_end)
+                )
+
+            focus_indices = sampler.indices[focus_mask]
+            if usable_anchors == 0 or len(focus_indices) == 0:
+                raise ValueError(
+                    "event oversampling found no usable training windows")
+            base_samples = len(sampler.indices)
+            if repeats > 1:
+                sampler.indices = np.concatenate(
+                    [sampler.indices]
+                    + [focus_indices.copy() for _ in range(repeats - 1)],
+                    axis=0)
+            print(
+                "[Dataset] event oversampling enabled: "
+                f"anchor={event_oversample_anchor}, before={before}, "
+                f"after={after}, repeats={repeats}, "
+                f"observation_gate={_format_observation_gate(observation_gate)}, "
+                f"gate_radius={observation_gate_radius}, "
+                f"anchor_ratio={anchor_ratio:.3f}, "
+                f"anchor_step_p10={np.quantile(anchor_steps, 0.10):.1f}, "
+                f"median={np.median(anchor_steps):.1f}, "
+                f"p90={np.quantile(anchor_steps, 0.90):.1f}, "
+                f"focus_samples={len(focus_indices)}, "
+                f"base_samples={base_samples}, "
+                f"total_samples={len(sampler.indices)}, "
+                f"usable_train_anchors={usable_anchors}")
         
         self.replay_buffer = replay_buffer
         self.sampler = sampler
         self.abs_action = abs_action
+        self.delta_action_normalizer = delta_action_normalizer
+        self.delta_action_identity_tolerance = (
+            delta_action_identity_tolerance)
         self.train_mask = train_mask
         self.horizon = horizon
         self.pad_before = pad_before
@@ -291,8 +439,22 @@ class RobomimicReplayLowdimDataset(BaseLowdimDataset):
             if self.use_legacy_normalizer:
                 this_normalizer = normalizer_from_stat(stat)
         else:
-            # already normalized
-            this_normalizer = get_identity_normalizer_from_stat(stat)
+            mode = self.delta_action_normalizer
+            if mode == 'auto':
+                tolerance = self.delta_action_identity_tolerance
+                already_bounded = bool(
+                    np.all(stat['min'] >= (-1.0 - tolerance))
+                    and np.all(stat['max'] <= (1.0 + tolerance)))
+                mode = 'identity' if already_bounded else 'limits'
+            if mode == 'identity':
+                this_normalizer = get_identity_normalizer_from_stat(stat)
+            else:
+                this_normalizer = get_range_normalizer_from_stat(stat)
+            print(
+                "[Dataset] delta action normalizer: "
+                f"requested={self.delta_action_normalizer}, selected={mode}, "
+                f"min={np.array2string(stat['min'], precision=4)}, "
+                f"max={np.array2string(stat['max'], precision=4)}")
         normalizer['action'] = this_normalizer
         
         # aggregate obs stats
@@ -472,6 +634,145 @@ def _find_prefix_anchor_index(
     if len(anchor_idxs) == 0:
         return None
     return int(anchor_idxs[0])
+
+
+def _find_action_anchor_index(
+        actions,
+        anchor='last_release',
+        close_threshold=0.0,
+        close_is_greater=True,
+        observations=None,
+        observation_gate=None,
+        observation_gate_radius=0):
+    """Find a first/last gripper transition without truncating an episode."""
+    supported = (
+        'first_close', 'last_close', 'first_release', 'last_release')
+    if anchor not in supported:
+        raise ValueError(
+            f"event_oversample_anchor must be one of {supported}, "
+            f"got {anchor!r}")
+    if len(actions) == 0:
+        return None
+
+    gripper = np.asarray(actions)[..., -1]
+    if close_is_greater:
+        close_mask = gripper > close_threshold
+    else:
+        close_mask = gripper < close_threshold
+    previous = np.zeros_like(close_mask, dtype=bool)
+    previous[1:] = close_mask[:-1]
+    if anchor.endswith('release'):
+        indices = np.flatnonzero(previous & (~close_mask))
+    else:
+        indices = np.flatnonzero((~previous) & close_mask)
+    if observation_gate is not None and len(indices) > 0:
+        if observations is None:
+            raise ValueError(
+                "an observation gate was configured without observations")
+        observations = np.asarray(observations)
+        if len(observations) != len(actions):
+            raise ValueError(
+                "observation/action length mismatch while locating event: "
+                f"obs={len(observations)}, actions={len(actions)}")
+        gate_indices, lower, upper = observation_gate
+        if np.any(gate_indices >= observations.shape[-1]):
+            raise ValueError(
+                "event observation gate index exceeds observation width: "
+                f"indices={gate_indices.tolist()}, "
+                f"obs_dim={observations.shape[-1]}")
+        radius = int(observation_gate_radius)
+        keep = list()
+        for index in indices:
+            start = max(0, int(index) - radius)
+            end = min(len(observations), int(index) + radius + 1)
+            selected = observations[start:end][:, gate_indices]
+            valid = np.ones(len(selected), dtype=bool)
+            if lower is not None:
+                valid &= np.all(selected >= lower, axis=-1)
+            if upper is not None:
+                valid &= np.all(selected <= upper, axis=-1)
+            keep.append(bool(np.any(valid)))
+        indices = indices[np.asarray(keep, dtype=bool)]
+    if len(indices) == 0:
+        return None
+    if anchor.startswith('last'):
+        return int(indices[-1])
+    return int(indices[0])
+
+
+def _find_reward_anchor_index(
+        rewards,
+        anchor='first_positive_reward'):
+    """Locate a task-success event already recorded by the dataset.
+
+    Reward-backed anchors are preferable to hand-tuned geometric proxies when
+    a dataset stores the environment's physical success signal. Episodes with
+    no positive reward return ``None`` and remain in the base dataset without
+    being duplicated as successful event windows.
+    """
+    supported = ('first_positive_reward', 'last_positive_reward')
+    if anchor not in supported:
+        raise ValueError(
+            f"reward anchor must be one of {supported}, got {anchor!r}")
+    if rewards is None:
+        return None
+    values = np.asarray(rewards).reshape(-1)
+    indices = np.flatnonzero(values > 0)
+    if len(indices) == 0:
+        return None
+    return int(indices[-1] if anchor.startswith('last') else indices[0])
+
+
+def _prepare_observation_gate(enabled, indices, lower, upper):
+    """Build a generic state predicate for action-transition anchors.
+
+    The predicate is intentionally task-configured rather than dataset-coded:
+    any delta or absolute-action dataset can select semantic observation
+    channels and require per-channel bounds at an event such as release.
+    """
+    if not _as_bool(enabled):
+        return None
+    if indices is None:
+        raise ValueError(
+            "event observation gate requires non-empty indices")
+    gate_indices = np.asarray(indices, dtype=np.int64).reshape(-1)
+    if len(gate_indices) == 0 or np.any(gate_indices < 0):
+        raise ValueError(
+            "event observation gate indices must be non-negative")
+
+    def prepare_bound(name, value):
+        if value is None:
+            return None
+        result = np.asarray(value, dtype=np.float32).reshape(-1)
+        if len(result) != len(gate_indices):
+            raise ValueError(
+                f"event observation gate {name} has {len(result)} values, "
+                f"expected {len(gate_indices)}")
+        return result
+
+    lower_bound = prepare_bound('min', lower)
+    upper_bound = prepare_bound('max', upper)
+    if lower_bound is None and upper_bound is None:
+        raise ValueError(
+            "event observation gate requires min and/or max bounds")
+    if (
+        lower_bound is not None
+        and upper_bound is not None
+        and np.any(lower_bound > upper_bound)
+    ):
+        raise ValueError(
+            "event observation gate min must not exceed max")
+    return gate_indices, lower_bound, upper_bound
+
+
+def _format_observation_gate(observation_gate):
+    if observation_gate is None:
+        return 'disabled'
+    indices, lower, upper = observation_gate
+    return (
+        f"indices={indices.tolist()}, "
+        f"min={None if lower is None else lower.tolist()}, "
+        f"max={None if upper is None else upper.tolist()}")
 
 
 def _is_auto(value):

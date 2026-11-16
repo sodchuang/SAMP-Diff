@@ -1,0 +1,2 @@
+# Keep Linux training and Slurm launchers executable after Windows edits.
+*.sh text eol=lf

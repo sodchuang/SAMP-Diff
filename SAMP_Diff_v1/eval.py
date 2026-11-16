@@ -267,6 +267,11 @@ class EvalObservationNoise:
 @click.option('--n-train', default=None, type=int, help='Override task.env_runner.n_train.')
 @click.option('--n-test-vis', default=None, type=int, help='Override task.env_runner.n_test_vis.')
 @click.option('--n-train-vis', default=None, type=int, help='Override task.env_runner.n_train_vis.')
+@click.option('--test-start-seed', default=None, type=int, help='Override task.env_runner.test_start_seed.')
+@click.option('--stack-stop-on-success', is_flag=True,
+              help='End Stack immediately when native success and object release are confirmed; no EEF retreat required.')
+@click.option('--stack-success-hold-steps', default=10, type=click.IntRange(min=1),
+              help='Hold steps for the separate strict retreat diagnostic; does not delay native-success termination.')
 @click.option(
     '--profile-actions/--no-profile-actions',
     default=True,
@@ -290,6 +295,9 @@ def main(
         n_train,
         n_test_vis,
         n_train_vis,
+        test_start_seed,
+        stack_stop_on_success,
+        stack_success_hold_steps,
         profile_actions,
         obs_noise_std,
         obs_noise_seed):
@@ -319,7 +327,13 @@ def main(
         'n_train': n_train,
         'n_test_vis': n_test_vis,
         'n_train_vis': n_train_vis,
+        'test_start_seed': test_start_seed,
     }
+    if stack_stop_on_success:
+        runner_overrides.update({
+            'stack_stop_on_success': True,
+            'stack_release_hold_steps': stack_success_hold_steps,
+        })
     with open_dict(cfg.task.env_runner):
         for key, value in runner_overrides.items():
             if value is not None:
@@ -351,6 +365,13 @@ def main(
     runner_log.update({
         'eval/obs_noise_std': float(obs_noise_std),
         'eval/obs_noise_seed': obs_noise_seed,
+        'eval/stack_stop_on_success': bool(
+            cfg.task.env_runner.get('stack_stop_on_success', False)),
+        'eval/stack_success_hold_steps': cfg.task.env_runner.get(
+            'stack_release_hold_steps', 1),
+        'eval/stack_termination_mode': (
+            'native_success_and_released' if cfg.task.env_runner.get(
+                'stack_stop_on_success', False) else 'environment_or_horizon'),
     })
     
     # dump log to json

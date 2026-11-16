@@ -26,6 +26,7 @@ class RobomimicLowdimWrapper(gym.Env):
         stack_release_hold_steps=1,
         stack_min_eef_distance=0.04,
         stack_min_gripper_open_width=0.04,
+        stack_stop_on_success=False,
         ):
 
         self.env = env
@@ -40,6 +41,9 @@ class RobomimicLowdimWrapper(gym.Env):
         self.tool_hang_insert_hold_steps = int(tool_hang_insert_hold_steps)
         self.tool_hang_full_hold_steps = int(tool_hang_full_hold_steps)
         self.stack_release_hold_steps = int(stack_release_hold_steps)
+        self.stack_stop_on_success = bool(stack_stop_on_success)
+        if self.stack_release_hold_steps < 1:
+            raise ValueError('stack_release_hold_steps must be at least 1')
         self.stack_min_eef_distance = float(stack_min_eef_distance)
         self.stack_min_gripper_open_width = float(
             stack_min_gripper_open_width)
@@ -110,6 +114,14 @@ class RobomimicLowdimWrapper(gym.Env):
         raw_obs, reward, done, info = self.env.step(action)
         self._update_tool_hang_stage_state()
         self._update_stack_release_state()
+        if self.stack_stop_on_success:
+            flags = self.get_stack_release_flags()
+            # Match the demonstration endpoint: stacked and no longer grasped.
+            # EEF retreat is a separate diagnostic, not a completion requirement.
+            if flags['available'] and flags['final_released_stacked']:
+                done = True
+                info = dict(info)
+                info['stack_terminated_on_success'] = True
         obs = np.concatenate([
             raw_obs[key] for key in self.obs_keys
         ], axis=0)
@@ -361,7 +373,7 @@ class RobomimicLowdimWrapper(gym.Env):
             'max_release_consecutive_steps': int(
                 self._stack_release_max_consecutive),
         }
-    
+
     def render(self, mode='rgb_array'):
         h, w = self.render_hw
         return self.env.render(mode=mode, 

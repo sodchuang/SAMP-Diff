@@ -25,6 +25,22 @@ case "${variant}" in
     rotation_rate="1.0"
     gripper_rate="1.0"
     ;;
+  WRONG_SP)
+    name="square_wrong_semantic_prior_seed42"
+    history_enabled="false"
+    translation_rate="1.0"
+    rotation_rate="1.0"
+    gripper_rate="1.0"
+    # Negative control: preserve the number of dimensions and all spectral
+    # hyperparameters, but deliberately assign physical action dimensions to
+    # the wrong semantic groups. This isolates the value of human-specified
+    # action semantics from simply having multiple parameter groups.
+    extra_overrides+=(
+      "policy.action_group_spectral_params.translation.indices=[3,4,5]"
+      "policy.action_group_spectral_params.rotation.indices=[0,1,2,6,7,9]"
+      "policy.action_group_spectral_params.gripper.indices=[8]"
+    )
+    ;;
   H0)
     name="square_history_legacy_rot015_6000"
     history_enabled="false"
@@ -96,7 +112,7 @@ case "${variant}" in
     rollout_every="${ROLLOUT_EVERY:-100}"
     ;;
   *)
-    echo "Usage: $0 {HOMO|SP|HG|GC_ONLY|FULL|H0|H1|H2|GC|GCR}" >&2
+    echo "Usage: $0 {HOMO|WRONG_SP|SP|HG|GC_ONLY|FULL|H0|H1|H2|GC|GCR}" >&2
     exit 2
     ;;
 esac
@@ -112,6 +128,51 @@ rollout_every="${ROLLOUT_EVERY:-${rollout_every:-50}}"
 n_envs="${N_ENVS:-28}"
 output_root="${OUTPUT_ROOT:-data/outputs/robomimic}"
 history_training_mode="${HISTORY_TRAINING_MODE:-legacy_shift}"
+resume_existing="${RESUME_EXISTING:-auto}"
+min_resume_epoch="${MIN_RESUME_EPOCH:-0}"
+
+output_dir="${output_root}/${name}"
+training_resume=false
+if [[ "${resume_existing}" == "auto" ]]; then
+  if [[ -f "${output_dir}/checkpoints/latest.ckpt" ]]; then
+    resume_existing=true
+  else
+    resume_existing=false
+  fi
+fi
+if [[ "${resume_existing}" == "true" ]]; then
+  latest_ckpt="${output_dir}/checkpoints/latest.ckpt"
+  if [[ ! -f "${latest_ckpt}" ]]; then
+    echo "[ERROR] Resume requested but checkpoint is missing: ${latest_ckpt}" >&2
+    echo "Check OUTPUT_ROOT; refusing to restart ${name} from epoch 0." >&2
+    exit 1
+  fi
+
+  resume_epoch="$(python - "${latest_ckpt}" <<'PY'
+import dill
+import sys
+import torch
+
+payload = torch.load(sys.argv[1], map_location="cpu", pickle_module=dill)
+raw = payload.get("pickles", {}).get("epoch")
+if raw is None:
+    raise SystemExit("[ERROR] checkpoint does not contain epoch")
+print(int(dill.loads(raw)))
+PY
+)"
+
+  if (( resume_epoch < min_resume_epoch )); then
+    echo "[ERROR] ${name} latest checkpoint is epoch ${resume_epoch}; expected >= ${min_resume_epoch}." >&2
+    echo "Refusing to mix an incomplete run into the 6000->${num_epochs} extension." >&2
+    exit 1
+  fi
+  if (( resume_epoch >= num_epochs - 1 )); then
+    echo "[SQUARE] ${name} already reached epoch ${resume_epoch}; target=${num_epochs}. Skip."
+    exit 0
+  fi
+  training_resume=true
+  echo "[SQUARE] continuing ${name}: epoch $((resume_epoch + 1)) -> $((num_epochs - 1))"
+fi
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
@@ -119,9 +180,11 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
 
 python train.py --config-name=square_ph \
-  "hydra.run.dir=${output_root}/${name}" \
-  training.resume=false \
+  "hydra.run.dir=${output_dir}" \
+  "training.resume=${training_resume}" \
   "training.num_epochs=${num_epochs}" \
+  "++training.lr_scheduler_num_epochs=${num_epochs}" \
+  "++training.lr_scheduler_start_epoch=0" \
   "training.rollout_every=${rollout_every}" \
   n_action_steps=4 \
   dataloader.persistent_workers=true \

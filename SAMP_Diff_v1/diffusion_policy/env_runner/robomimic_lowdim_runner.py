@@ -87,6 +87,7 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
             stack_release_hold_steps=1,
             stack_min_eef_distance=0.04,
             stack_min_gripper_open_width=0.04,
+            stack_stop_on_success=False,
             tqdm_interval_sec=5.0,
             n_envs=None
         ):
@@ -176,6 +177,7 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
                             stack_release_hold_steps=stack_release_hold_steps,
                             stack_min_eef_distance=stack_min_eef_distance,
                             stack_min_gripper_open_width=stack_min_gripper_open_width,
+                            stack_stop_on_success=stack_stop_on_success,
                         ),
                         video_recoder=VideoRecorder.create_h264(
                             fps=fps,
@@ -496,15 +498,11 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
 
             stack_flags = all_stack_flags[i]
             if self.is_stack:
-                # Do not count transient contact as Stack success. The main
-                # paper metric is 1 only when the cube remains released on the
-                # target and the gripper has moved away at the episode end.
+                # Keep the native environment reward for benchmark metrics.
+                # Released stacking with EEF retreat remains a separate metric.
                 raw_max_reward = max_reward
                 strict_score = float(bool(stack_flags.get(
                     'strict_success', False)))
-                max_reward = strict_score
-                final_reward = strict_score
-                stable_reward = strict_score
                 log_data[prefix+f'sim_raw_max_reward_{seed}'] = raw_max_reward
                 log_data[prefix+f'stack_release_success_{seed}'] = strict_score
                 for key in (

@@ -38,6 +38,18 @@ task:
   dataset_type: core
   dataset:
     abs_action: false
+    # Official MimicGen OSC_POSE commands are already bounded to [-1, 1].
+    # Other delta datasets may store physical increments instead, so detect
+    # the contract from the dataset rather than assuming identity scaling.
+    delta_action_normalizer: auto
+    delta_action_identity_tolerance: 0.05
+    # Task launchers can gate a command transition with observation-space
+    # geometry. This stays disabled unless the task supplies semantic bounds.
+    event_oversample_observation_gate_enabled: false
+    event_oversample_observation_gate_indices: null
+    event_oversample_observation_gate_min: null
+    event_oversample_observation_gate_max: null
+    event_oversample_observation_gate_radius: 0
   env_runner:
     abs_action: false
 
