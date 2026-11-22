@@ -9,6 +9,7 @@ import numpy as np
 import multiprocessing as mp
 import time
 import sys
+import traceback
 from enum import Enum
 from copy import deepcopy
 
@@ -53,6 +54,9 @@ def _concatenate_observations(space, items, out):
 
 
 def _send_worker_error(pipe, index, error_queue):
+    # Empty AssertionError messages otherwise lose the only useful evidence.
+    # Keep the original exception type and queue protocol unchanged.
+    traceback.print_exc(file=sys.stderr)
     error_queue.put((index,) + sys.exc_info()[:2])
     try:
         pipe.send((None, False))
