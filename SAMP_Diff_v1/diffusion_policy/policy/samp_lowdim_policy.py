@@ -20,6 +20,7 @@ import torch.nn as nn
 from diffusion_policy.model.common.normalizer import LinearNormalizer
 from diffusion_policy.policy.base_lowdim_policy import BaseLowdimPolicy
 from diffusion_policy.model.SAMP.samp_net import SampNet
+from diffusion_policy.common.fixed_phase_prior import FixedPhasePrior
 from diffusion_policy.utils.flow.flow_matchers import (
     ConditionalFlowMatcher,
     TorchFlowMatcher,
@@ -74,6 +75,7 @@ class SampLowdimPolicy(BaseLowdimPolicy):
         action_group_timing_params=None,
         action_phase_loss_params=None,
         history_training_mode: str = "legacy_shift",
+        fixed_phase_prior_params=None,
         # Policy convention flags
         obs_as_global_cond: bool = True,
         obs_as_local_cond: bool = False,
@@ -101,6 +103,17 @@ class SampLowdimPolicy(BaseLowdimPolicy):
         self.cold_start_prob = cold_start_prob
         self.action_group_history_params = action_group_history_params
         self.action_group_timing_params = action_group_timing_params
+        self.fixed_phase_prior = None
+        if fixed_phase_prior_params and fixed_phase_prior_params.get('enabled', False):
+            if action_group_timing_params and any(
+                v.get('enabled', False) for v in action_group_timing_params.values()
+            ):
+                raise ValueError('fixed phases cannot be combined with gripper latching')
+            self.fixed_phase_prior = FixedPhasePrior(
+                action_dim, n_action_steps,
+                mode=fixed_phase_prior_params.get('mode', 'selective'),
+                profiles=fixed_phase_prior_params.get('profiles'),
+                max_streams=fixed_phase_prior_params.get('max_streams', 256))
         self.history_training_mode = str(history_training_mode).lower()
         if self.history_training_mode not in ("legacy_shift", "aligned"):
             raise ValueError(
@@ -526,6 +539,13 @@ class SampLowdimPolicy(BaseLowdimPolicy):
             dtype=dtype,
         )
 
+        source_prior = None
+        if self.fixed_phase_prior is not None:
+            reference = nobs.new_zeros(B, self.samp_net.horizon, self.action_dim)
+            aligned, valid, phase, contexts = self.fixed_phase_prior.prepare(obs_dict, reference)
+            source_prior = self.fixed_phase_prior.source(aligned, valid, phase, self.samp_net.full_dct)
+            fresh_action_indices = None
+
         # ---- sample ----
         self.samp_net.eval()
         nsample = self.samp_net.sample(
@@ -534,11 +554,15 @@ class SampLowdimPolicy(BaseLowdimPolicy):
             global_cond=global_cond,
             num_steps=self.num_inference_steps,
             fresh_action_indices=fresh_action_indices,
+            source_prior=source_prior,
         )  # (B, H, Da) normalised
 
         # store for next call
-        self._prev_action = nsample.detach().clone()
-        self._update_history_buffers(nsample, aligned_history)
+        if self.fixed_phase_prior is not None:
+            self.fixed_phase_prior.commit(contexts, nsample, phase)
+        else:
+            self._prev_action = nsample.detach().clone()
+            self._update_history_buffers(nsample, aligned_history)
 
         # ---- unnormalize ----
         action_pred = self.normalizer['action'].unnormalize(nsample)  # (B, H, Da)
@@ -568,6 +592,8 @@ class SampLowdimPolicy(BaseLowdimPolicy):
 
     def reset(self):
         """Clear warm-start buffer (call between episodes)."""
+        if self.fixed_phase_prior is not None:
+            self.fixed_phase_prior.clear()
         self._prev_action = None
         self._history_buffers.clear()
         self._gripper_latch_remaining = None
@@ -590,7 +616,7 @@ class SampLowdimPolicy(BaseLowdimPolicy):
         """
         assert 'valid_mask' not in batch, "valid_mask not supported"
 
-        nbatch = self.normalizer.normalize(batch)
+        nbatch = self.normalizer.normalize({'obs': batch['obs'], 'action': batch['action']})
         obs = nbatch['obs']      # (B, To, Do)  normalised
         action = nbatch['action']  # (B, H, Da) normalised
         B = action.shape[0]
@@ -612,6 +638,12 @@ class SampLowdimPolicy(BaseLowdimPolicy):
         # training must use an aligned teacher-forced prior. The legacy mode is
         # retained for checkpoint compatibility and controlled ablations.
         prev_actions = self._build_training_history_prior(trajectory)
+        source_prior = None
+        if self.fixed_phase_prior is not None:
+            if self.history_training_mode != 'aligned':
+                raise ValueError('fixed-phase training requires history_training_mode=aligned')
+            source_prior = self.fixed_phase_prior.source(
+                prev_actions, batch['history_valid_mask'], batch['phase_id'], self.samp_net.full_dct)
 
         # ---- loss ----
         loss = self.samp_net(
@@ -620,6 +652,7 @@ class SampLowdimPolicy(BaseLowdimPolicy):
             prev_actions=prev_actions,
             global_cond=global_cond,
             cold_start_prob=self.cold_start_prob,
-            fresh_action_indices=self._fresh_history_indices(),
+            fresh_action_indices=self._fresh_history_indices() if source_prior is None else None,
+            source_prior=source_prior,
         )
         return loss

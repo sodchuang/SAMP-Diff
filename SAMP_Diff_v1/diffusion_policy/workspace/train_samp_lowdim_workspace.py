@@ -638,6 +638,10 @@ class TrainSampLowdimWorkspace(BaseWorkspace):
                     with torch.no_grad():
                         batch = train_sampling_batch
                         obs_dict = {'obs': batch['obs']}
+                        if getattr(policy, 'fixed_phase_prior', None) is not None:
+                            obs_dict.update({key: batch[key] for key in
+                                             ('phase_id', 'task_id', 'episode_id', 'step')})
+                            obs_dict['stream_id'] = torch.arange(batch['obs'].shape[0])
                         gt_action = batch['action']
                         # reset warm-start buffer so sampling is deterministic
                         policy.reset()

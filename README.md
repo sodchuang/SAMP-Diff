@@ -2,6 +2,10 @@
 
 Spectral-Adaptive Modulated Prior Diffusion experiments for low-dimensional robot manipulation tasks.
 
+Experimental second-paper support: [fixed semantic profiles, episode-local slicing,
+and per-arm history isolation](SAMP_Diff_v1/FIXED_PHASES.md). Opt-in; existing
+single-task defaults remain unchanged. Online phase detection is not included.
+
 ## VM Quick Start
 
 ```bash

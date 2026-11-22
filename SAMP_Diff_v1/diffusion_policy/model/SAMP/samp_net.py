@@ -1033,6 +1033,7 @@ class SampNet(nn.Module):
         global_cond: torch.Tensor,
         cold_start_prob: float = 0.2,
         fresh_action_indices=None,
+        source_prior=None,
     ) -> torch.Tensor:
         """Compute flow-matching loss.
 
@@ -1055,7 +1056,9 @@ class SampNet(nn.Module):
 
         # Every action dimension stays in DCT space. Only the prior schedule
         # differs by action group when action_group_spectral_params is set.
-        x_0_warm = self.spectral_prior(prev_actions)
+        x_0_warm = self.spectral_prior(prev_actions) if source_prior is None else source_prior
+        if x_0_warm.shape != x_1.shape:
+            raise ValueError('source_prior shape must match the DCT action trajectory')
         if fresh_action_indices:
             x_0_warm[:, :, fresh_action_indices] = torch.randn_like(
                 x_0_warm[:, :, fresh_action_indices]
@@ -1103,6 +1106,7 @@ class SampNet(nn.Module):
         global_cond: torch.Tensor,
         num_steps: int = 6,
         fresh_action_indices=None,
+        source_prior=None,
     ) -> torch.Tensor:
         """Generate action trajectory via Euler ODE in DCT space.
 
@@ -1118,7 +1122,11 @@ class SampNet(nn.Module):
         B, H, Da = global_cond.shape[0], self.horizon, self.trajectory_dim
         device = global_cond.device
 
-        if prev_actions is None:
+        if source_prior is not None:
+            if source_prior.shape != (B, H, Da):
+                raise ValueError('source_prior shape mismatch')
+            x_0 = source_prior
+        elif prev_actions is None:
             x_0 = torch.randn(B, H, Da, device=device)
         else:
             x_0 = self.spectral_prior(prev_actions)
