@@ -7,6 +7,7 @@ import pathlib
 import tqdm
 import dill
 import math
+from functools import partial
 import wandb.sdk.data_types.video as wv
 from diffusion_policy.gym_util.async_vector_env import AsyncVectorEnv
 # from diffusion_policy.gym_util.sync_vector_env import SyncVectorEnv
@@ -20,7 +21,7 @@ from diffusion_policy.env_runner.base_lowdim_runner import BaseLowdimRunner
 from diffusion_policy.env.robomimic.robomimic_lowdim_wrapper import RobomimicLowdimWrapper
 
 
-def create_env(env_meta, obs_keys):
+def create_env(env_meta, obs_keys, render_offscreen=False):
     env_name = str(env_meta.get('env_name', ''))
     # MimicGen environments register themselves with robosuite at import
     # time.  Without this import, dataset loading succeeds but the first
@@ -43,10 +44,9 @@ def create_env(env_meta, obs_keys):
     env = EnvUtils.create_env_from_metadata(
         env_meta=env_meta,
         render=False, 
-        # only way to not show collision geometry
-        # is to enable render_offscreen
-        # which uses a lot of RAM.
-        render_offscreen=False,
+        # Video workers need an offscreen context. The parent dummy used to
+        # discover spaces must stay headless before processes are forked.
+        render_offscreen=render_offscreen,
         use_image_obs=False, 
     )
     return env
@@ -155,10 +155,11 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
             self.action_clip_min = action_min
             self.action_clip_max = action_max
 
-        def env_fn():
+        def env_fn(render_offscreen=bool(n_train_vis or n_test_vis)):
             robomimic_env = create_env(
                     env_meta=env_meta, 
-                    obs_keys=obs_keys
+                    obs_keys=obs_keys,
+                    render_offscreen=render_offscreen,
                 )
             # hard reset doesn't influence lowdim env
             # robomimic_env.env.hard_reset = False
@@ -257,7 +258,8 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
             env_prefixs.append('test/')
             env_init_fn_dills.append(dill.dumps(init_fn))
         
-        env = AsyncVectorEnv(env_fns)
+        dummy_env_fn = partial(env_fn, render_offscreen=False)
+        env = AsyncVectorEnv(env_fns, dummy_env_fn=dummy_env_fn)
         # env = SyncVectorEnv(env_fns)
 
         self.env_meta = env_meta
@@ -269,6 +271,7 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
         self.is_stack = normalized_env_name.startswith('stack')
         self.env = env
         self.env_fns = env_fns
+        self.dummy_env_fn = dummy_env_fn
         self.env_seeds = env_seeds
         self.env_prefixs = env_prefixs
         self.env_init_fn_dills = env_init_fn_dills
@@ -297,7 +300,7 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
             old_env.close_extras(terminate=True)
         except Exception as exc:
             print(f"[WARN] Failed to fully close broken rollout workers: {exc}")
-        self.env = AsyncVectorEnv(self.env_fns)
+        self.env = AsyncVectorEnv(self.env_fns, dummy_env_fn=self.dummy_env_fn)
         print("[WARN] Recreated rollout environments after worker failure.")
 
     @staticmethod
